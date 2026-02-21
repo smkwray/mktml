@@ -155,11 +155,12 @@ python src/main.py --pipeline full
 
 This section is intended to be maintainer-updated as new evaluation data arrives.
 
-- Latest evaluation date: `YYYY-MM-DD`
-- Current benchmark-aligned sample count: `N`
-- Current BUY-outcome sample count: `N`
-- Next reliability milestone target: `describe threshold and estimated date/window`
-- Notes: `brief interpretation of progress and caveats`
+- Latest evaluation date: `2026-02-19` (from `reports/public/model_performance_spy.md`; latest daily report is `2026-02-20`).
+- Current benchmark-aligned sample count: `5` (target `20`; remaining `15`).
+- Current BUY-outcome sample count: `6` (target `30`; remaining `24`).
+- Next reliability milestone target: benchmark-aligned dates (`20`) are estimated around `2026-03-12` to `2026-03-13` assuming roughly one new aligned market-day sample per trading day.
+- Expected next data availability: additional 5-day outcome data for the `2026-02-20` report should begin landing around `2026-02-27` (five trading days later).
+- Notes: directional sample size already passes minimum (`241 >= 200`), while benchmark alignment and BUY-outcome slices are still early-sample and should be interpreted cautiously until those gates are met.
 
 ## Core CLI Commands
 
