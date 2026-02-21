@@ -1,0 +1,53 @@
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Local environment tooling
+.python-version
+.venv/
+.venv312/
+
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
+
+# Runtime artifacts and generated outputs
+data/
+models/
+reports/
+reports-archive/
+logs/
+*.log
+*.pid
+scan.log
+dashboard.log
+debug_eta.log
+qual.log
+SCAN_STATUS.md
+TRAIN_STATUS.md
+
+# Local AI prompting/memory files (private workflow)
+.agent/
+AGENTS.md
+CLAUDE.md
+plan.md
+qual_metrics_plan.md
+prompt/
+
+# Local/private configuration and credentials
+config.py
+.env
+.env.*
+!.env.example
+!examples/public/.env.example
+
+# Local archives/history
+old/
+docs-archive/
+*archive*/
+
+# Personal host-specific automation files
+scripts/com.*.plist

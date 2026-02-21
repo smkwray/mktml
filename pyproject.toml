@@ -1,0 +1,21 @@
+[project]
+name = "market"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "duckdb>=1.4.3",
+    "lxml>=6.0.2",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.0",
+    "pandas>=2.3.3",
+    "requests>=2.32.5",
+    "scikit-learn>=1.8.0",
+    "xgboost>=2.0.0",
+    "yfinance>=1.0",
+    "plotly>=5.18.0",
+    "fredapi>=0.5.0",
+    "flask>=3.0.0",
+]

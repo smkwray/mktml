@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Optional local hook: blocks push when private/sensitive artifacts are in scope.
+"$(cd "$(dirname "$0")/.." && pwd)/scripts/public_push_guard.sh"
