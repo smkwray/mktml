@@ -17,7 +17,7 @@ It runs entirely on your machine — no cloud account, no subscription, no data 
 3. **Trains an ensemble ML model** (Random Forest + Gradient Boosting + optional XGBoost) on 5-year history, scoring each ticker across 5d/10d/30d horizons.
 4. **Scans your universe** and synthesizes a BUY/HOLD/SELL recommendation for every ticker, with calibrated confidence scores.
 5. **Generates a daily report** (Markdown + JSON) with top picks, exit alerts for your holdings, and data-health checks.
-6. **Tracks its own accuracy** via an audit system that records every recommendation and measures outcomes against SPY.
+6. **Tracks its own accuracy** via an audit system that records every recommendation and measures outcomes against SPY, other benchmarks, or a composite.
 
 ## Quick Start
 
