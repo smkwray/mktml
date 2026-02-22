@@ -1,6 +1,6 @@
 # MktML
 
-<img src="assets/mktml-mole-logo.png" alt="MktML mole mascot logo" width="120" />
+<img src="assets/mktml-mole-logo.png" alt="MktML mole mascot logo" width="200" />
 
 (/ˈmɑrkət mol/)
 
