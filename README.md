@@ -1,10 +1,10 @@
-# MktML
+# MarketML
 
 <p align="center">
   <img src="assets/mktml-mole-logo.png" alt="MktML mole mascot logo" width="200">
 </p>
 
-(/ˈmɑrkət mol/)
+(/ˈmɑːrkɪt moʊl/)
 
 MktML is a local-first stock research pipeline that uses machine learning to generate daily BUY / HOLD / SELL recommendations. It pulls price data from up to 11 providers, trains an ensemble model across three time horizons (5-day, 10-day, 30-day), and produces human-readable reports you can act on or feed into other tools.
 
