@@ -1,4 +1,4 @@
-# MarketML
+# MarketMoLe
 
 <p align="center">
   <img src="assets/mktml-mole-logo.png" alt="MktML mole mascot logo" width="200">
