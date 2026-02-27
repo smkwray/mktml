@@ -882,6 +882,14 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
     except Exception as e:
         print(f"Warning: Could not load qual features: {e}. Using defaults.", flush=True)
         qual_cache = {}
+
+    try:
+        from news_loader import get_news_features
+        news_data = get_news_features()
+        print(f"Loaded news features: {news_data}", flush=True)
+    except Exception as e:
+        print(f"Warning: Could not load news features: {e}. Using defaults.", flush=True)
+        news_data = {}
     
     # Auto-refresh external yields (ASYNC - runs in background, doesn't block scan)
     try:
@@ -1083,6 +1091,7 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
                         dividend_info=div_info,
                         macro_data=macro_data,
                         qual_data=qual_data,
+                        news_data=news_data,
                         horizon=10,
                         for_inference=True,
                     )
@@ -1446,8 +1455,9 @@ def _apply_replay_context_to_feature_row(
     feature_row: pd.Series,
     macro_data: Dict[str, float],
     dividend_info: Dict[str, Any],
+    news_data: Dict[str, float] = None,
 ) -> pd.Series:
-    """Inject as-of macro and dividend context into a precomputed feature row."""
+    """Inject as-of macro, news, and dividend context into a precomputed feature row."""
     row = feature_row.copy()
     macro = macro_data or {}
 
@@ -1458,6 +1468,18 @@ def _apply_replay_context_to_feature_row(
     row['macro_hy_spread'] = float(macro.get('macro_BAMLH0A0HYM2', 4) or 4)
     row['macro_stress'] = float(macro.get('macro_STLFSI4', 0) or 0)
     row['macro_fed_assets_chg'] = float(macro.get('macro_WALCL_chg1m', 0) or 0) / 1e12
+
+    # News features (daily market-level, signed scale)
+    news = news_data or {}
+    row['news_trade_policy'] = news.get('news_trade_policy', 0)
+    row['news_geopolitical'] = news.get('news_geopolitical', 0)
+    row['news_regulatory'] = news.get('news_regulatory', 0)
+    row['news_monetary_surprise'] = news.get('news_monetary_surprise', 0)
+    row['news_energy_supply'] = news.get('news_energy_supply', 0)
+    row['news_event_shock'] = news.get('news_event_shock', 0)
+    row['news_sentiment_net'] = news.get('news_sentiment_net', 0)
+    row['news_risk_total'] = news.get('news_risk_total', 0)
+    row['news_risk_chg'] = news.get('news_risk_chg', 0)
 
     rsi = float(row.get('rsi', 0) or 0)
     dist_sma_200 = float(row.get('dist_sma_200', 0) or 0)
@@ -1816,6 +1838,7 @@ def run_replay_scan(start_date: str, end_date: str, flush_rows: int = 5000, max_
     from storage import get_connection
     from ml_engine import extract_ml_features, get_multi_horizon_confidence, load_qual_features
     from macro_loader import fetch_all_macro_data, get_macro_features_asof
+    from news_loader import load_all_news_cache, get_news_features_asof
 
     con = get_connection(read_only=True)
     replay_dates_df = con.execute(
@@ -1909,6 +1932,14 @@ def run_replay_scan(start_date: str, end_date: str, flush_rows: int = 5000, max_
         macro_series_cache = {}
     macro_asof_cache: Dict[pd.Timestamp, Dict[str, float]] = {}
 
+    try:
+        news_cache = load_all_news_cache()
+        if news_cache:
+            print(f"Replay scan: loaded news cache for {len(news_cache)} dates.", flush=True)
+    except Exception as e:
+        print(f"Replay scan: news cache load failed ({e}); using defaults.")
+        news_cache = {}
+
     ticker_cache = {}
     for ticker, group in price_df.groupby('ticker', sort=True):
         if len(group) < 200:
@@ -1937,6 +1968,7 @@ def run_replay_scan(start_date: str, end_date: str, flush_rows: int = 5000, max_
                 dividend_info={},
                 macro_data={},
                 qual_data=qual_data,
+                news_data={},
                 horizon=10,
                 for_inference=True,
             )
@@ -2006,10 +2038,12 @@ def run_replay_scan(start_date: str, end_date: str, flush_rows: int = 5000, max_
                 dividend_history_cache,
                 fundamentals_cache,
             )
+            asof_news = get_news_features_asof(asof_date, news_cache=news_cache)
             feature_row = _apply_replay_context_to_feature_row(
                 data['feature_df'].iloc[feat_idx - 1],
                 asof_macro,
                 dividend_info,
+                news_data=asof_news,
             )
             try:
                 horizon_confs = get_multi_horizon_confidence(feature_row, ticker=ticker)

@@ -172,17 +172,18 @@ def main():
     parser.add_argument('--learn', action='store_true', help='Learn from past recommendation performance')
     parser.add_argument('--notify', action='store_true', help='Send daily summary notification from latest public model report')
     parser.add_argument('--notify-weekly', action='store_true', help='Send weekly summary notification from latest public model report')
+    parser.add_argument('--update-news', action='store_true', help='Fetch daily market news assessment via Gemini CLI')
     parser.add_argument('--all', action='store_true', help='[DEPRECATED] Use --pipeline full')
-    parser.add_argument('--pipeline', type=str, help='Run steps in order. Comma-separated (scan,backfill,audit,train,calibrate,verify_artifacts,report,notify,notify_weekly) or preset (daily, full, daily_auto)')
+    parser.add_argument('--pipeline', type=str, help='Run steps in order. Comma-separated (scan,backfill,audit,train,calibrate,verify_artifacts,report,notify,notify_weekly,update_news) or preset (daily, full, daily_auto)')
     
     args = parser.parse_args()
     
     # === PIPELINE EXECUTION ===
     PIPELINE_PRESETS = {
-        'daily': ['scan', 'report'],
-        'daily_auto': ['scan', 'backfill', 'audit', 'report', 'notify'],
+        'daily': ['update_news', 'scan', 'report'],
+        'daily_auto': ['update_news', 'scan', 'backfill', 'audit', 'report', 'notify'],
         'weekly_summary': ['backfill', 'audit', 'notify_weekly'],
-        'full': ['train', 'calibrate', 'verify_artifacts', 'scan', 'report'],
+        'full': ['update_news', 'train', 'calibrate', 'verify_artifacts', 'scan', 'report'],
         'verify': ['verify_artifacts'],
         'retrain': ['train'],
         'refresh': ['scan', 'backfill', 'audit', 'report'],
@@ -208,7 +209,10 @@ def main():
         for i, step in enumerate(pipeline_steps, 1):
             print(f"--- Phase {i}/{len(pipeline_steps)}: {step.upper()} ---")
             try:
-                if step == 'scan':
+                if step in ('update_news', 'update-news', 'news'):
+                    from news_loader import fetch_daily_news
+                    fetch_daily_news()
+                elif step == 'scan':
                     scan_results, scan_meta = run_full_scan(return_meta=True)
                 elif step in ('replay', 'replay_scan', 'replay-scan'):
                     if not args.start or not args.end:
@@ -334,7 +338,12 @@ def main():
     if args.train_ml:
         train_market_model()
         return
-        
+
+    if args.update_news:
+        from news_loader import fetch_daily_news
+        fetch_daily_news(force=True)
+        return
+
     if args.tickers:
         initialize_db() # Ensure DB exists
         for ticker in args.tickers:

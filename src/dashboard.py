@@ -155,6 +155,15 @@ STATE = {
     'weekly_summary_running': False,
     'weekly_summary_last_result': None,
 
+    # News assessment schedule (morning + evening Gemini CLI calls)
+    'news_morning_time': '08:30',
+    'news_evening_time': '16:30',
+    'news_days': [0, 1, 2, 3, 4],  # Default M-F
+    'news_scheduled_time': None,
+    'news_running': False,
+    'news_last_run': None,
+    'news_last_result': None,
+
     # Analytics snapshot scheduler
     'snapshot_interval_minutes': 45,
     'snapshot_scheduled_time': None,
@@ -162,7 +171,7 @@ STATE = {
     'snapshot_running': False,
     'snapshot_last_run': None,
     'snapshot_last_result': None,
-    
+
     # Legacy compat
     'last_result': None,
 }
@@ -173,12 +182,14 @@ PROCESSES = {
     'scan': None,
     'train': None,
     'qual': None,
+    'news': None,
     'audit': None,
     'weekly_summary': None,
     'snapshot': None,
 }
 PROCESS_LOCK = threading.Lock()
 SCAN_SCHEDULER_STARTED = False
+NEWS_SCHEDULER_STARTED = False
 AUDIT_SCHEDULER_STARTED = False
 WEEKLY_SUMMARY_SCHEDULER_STARTED = False
 SNAPSHOT_SCHEDULER_STARTED = False
@@ -1423,6 +1434,38 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="card card-compact">
+            <h2>News Assessment</h2>
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                <button class="btn btn-primary" onclick="runNews()" id="newsBtn">📰 Run Now</button>
+                <button class="btn btn-danger" onclick="stopOp('news')" id="stopNewsBtn" style="display:none;">🛑 Stop News</button>
+                <span id="newsOpStatus" style="color:#888; font-size:0.85rem;"></span>
+            </div>
+            <div class="schedule-form" style="margin-top:15px;">
+                <div class="schedule-row">
+                    <label style="color:#888;">Morning:</label>
+                    <input type="time" id="newsMorningTime" value="08:30">
+                    <label style="color:#888;">Evening:</label>
+                    <input type="time" id="newsEveningTime" value="16:30">
+                </div>
+                <div class="schedule-row">
+                    <button class="btn btn-warning" onclick="setNewsSchedule()" id="newsScheduleBtn">⏰ Schedule</button>
+                    <button class="btn btn-danger" onclick="cancelNewsSchedule()" id="newsCancelBtn" style="display:none;">✖ Cancel</button>
+                </div>
+                <div class="days-selector" id="newsDays">
+                    <label class="day-check"><input type="checkbox" value="0" checked><span>M</span></label>
+                    <label class="day-check"><input type="checkbox" value="1" checked><span>T</span></label>
+                    <label class="day-check"><input type="checkbox" value="2" checked><span>W</span></label>
+                    <label class="day-check"><input type="checkbox" value="3" checked><span>R</span></label>
+                    <label class="day-check"><input type="checkbox" value="4" checked><span>F</span></label>
+                    <label class="day-check"><input type="checkbox" value="5"><span>S</span></label>
+                    <label class="day-check"><input type="checkbox" value="6"><span>N</span></label>
+                </div>
+            </div>
+            <p class="info">📰 Trade policy, geopolitical, regulatory & event shock scores via Gemini CLI (morning pre-market + evening post-close).</p>
+            <div id="newsStatus"></div>
+        </div>
+
+        <div class="card card-compact">
             <h2>Audit</h2>
             <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
                 <button class="btn btn-secondary" onclick="runAudit()" id="auditBtn">📋 Run Now</button>
@@ -2145,6 +2188,7 @@ HTML_TEMPLATE = """
                     if (data.scan_running) runningList.push('🔍 Scan');
                     if (data.train_running) runningList.push('🧠 Train');
                     if (data.qual_running) runningList.push('🏭 Qual');
+                    if (data.news_running) runningList.push('📰 News');
                     if (data.audit_running) runningList.push('📋 Audit');
                     if (data.weekly_summary_running) runningList.push('🗞️ Weekly');
                     if (data.snapshot_running) runningList.push('📸 Snapshot');
@@ -2231,6 +2275,25 @@ HTML_TEMPLATE = """
                         qualScheduleBtn.style.display = 'inline-block';
                         qualCancelBtn.style.display = 'none';
                         qualStatus.innerHTML = '';
+                    }
+
+                    // News section
+                    document.getElementById('stopNewsBtn').style.display = data.news_running ? 'inline-block' : 'none';
+                    document.getElementById('newsBtn').disabled = data.news_running;
+                    document.getElementById('newsOpStatus').textContent = data.news_running ? 'Running...' :
+                        (data.news_last_result || '');
+
+                    const newsScheduleBtn = document.getElementById('newsScheduleBtn');
+                    const newsCancelBtn = document.getElementById('newsCancelBtn');
+                    const newsStatus = document.getElementById('newsStatus');
+                    if (data.news_scheduled_time) {
+                        newsScheduleBtn.style.display = 'none';
+                        newsCancelBtn.style.display = 'inline-block';
+                        newsStatus.innerHTML = `<p class="info" style="color:#e879f9;">📰 Next: ${data.news_scheduled_time}<br/>Morning: ${data.news_morning_time} · Evening: ${data.news_evening_time} (${formatDays(data.news_days || [])})</p>`;
+                    } else {
+                        newsScheduleBtn.style.display = 'inline-block';
+                        newsCancelBtn.style.display = 'none';
+                        newsStatus.innerHTML = '';
                     }
 
                     // Audit section
@@ -2325,6 +2388,25 @@ HTML_TEMPLATE = """
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({chunk_size: parseInt(chunk)})
             }).then(updateStatus);
+        }
+
+        function runNews() {
+            fetch('/run/news', {method: 'POST'}).then(updateStatus);
+        }
+
+        function setNewsSchedule() {
+            const morningTime = document.getElementById('newsMorningTime').value;
+            const eveningTime = document.getElementById('newsEveningTime').value;
+            const days = getSelectedDays('newsDays');
+            fetch('/news_schedule', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({morning_time: morningTime, evening_time: eveningTime, days: days})
+            }).then(updateStatus);
+        }
+
+        function cancelNewsSchedule() {
+            fetch('/news_schedule', {method: 'DELETE'}).then(updateStatus);
         }
 
         function runAudit() {
@@ -2872,6 +2954,7 @@ def status():
             'scan_running': scan_running,
             'train_running': STATE.get('train_running', False),
             'qual_running': STATE.get('qual_running', False),
+            'news_running': STATE.get('news_running', False),
             'audit_running': STATE.get('audit_running', False),
             'weekly_summary_running': STATE.get('weekly_summary_running', False),
             'snapshot_running': STATE.get('snapshot_running', False),
@@ -2893,6 +2976,12 @@ def status():
             'qual_chunk_size': STATE.get('qual_chunk_size', 20),
             'qual_interval_hours': STATE.get('qual_interval_hours', 4),
             'qual_last_result': STATE.get('qual_last_result'),
+            # News
+            'news_scheduled_time': STATE['news_scheduled_time'].strftime('%Y-%m-%d %H:%M') if STATE.get('news_scheduled_time') else None,
+            'news_morning_time': STATE.get('news_morning_time', '08:30'),
+            'news_evening_time': STATE.get('news_evening_time', '16:30'),
+            'news_days': STATE.get('news_days', [0, 1, 2, 3, 4]),
+            'news_last_result': STATE.get('news_last_result'),
             # Audit
             'audit_scheduled_time': STATE['audit_scheduled_time'].strftime('%Y-%m-%d %H:%M') if STATE.get('audit_scheduled_time') else None,
             'audit_days': STATE.get('audit_days', [0, 1, 2, 3, 4]),
@@ -2915,7 +3004,7 @@ def status():
 
 @app.route('/stop/<operation>', methods=['POST'])
 def stop_operation(operation):
-    """Stop a specific operation (scan, train, qual, audit, weekly_summary, snapshot)."""
+    """Stop a specific operation (scan, train, qual, news, audit, weekly_summary, snapshot)."""
     with PROCESS_LOCK:
         proc = PROCESSES.get(operation)
         if proc:
@@ -2997,6 +3086,18 @@ def run_train():
     
     threading.Thread(target=lambda: run_op_internal('train'), daemon=True).start()
     return jsonify({'status': 'started', 'operation': 'train'})
+
+
+@app.route('/run/news', methods=['POST'])
+def run_news():
+    """Run news assessment now (fetches via Gemini CLI)."""
+    with STATE_LOCK:
+        if STATE.get('news_running'):
+            return jsonify({'error': 'News already running'}), 400
+        STATE['news_running'] = True
+
+    threading.Thread(target=lambda: run_op_internal('news'), daemon=True).start()
+    return jsonify({'status': 'started', 'operation': 'news'})
 
 
 @app.route('/run/audit', methods=['POST'])
@@ -3161,6 +3262,55 @@ def _start_scan_scheduler_once():
     threading.Thread(target=scan_scheduler_loop, daemon=True).start()
 
 
+def _start_news_scheduler_once():
+    """Start a single background scheduler loop for news assessments (morning + evening)."""
+    global NEWS_SCHEDULER_STARTED
+    if NEWS_SCHEDULER_STARTED:
+        return
+    NEWS_SCHEDULER_STARTED = True
+
+    def news_scheduler_loop():
+        while True:
+            with STATE_LOCK:
+                target = STATE.get('news_scheduled_time')
+                if target is not None:
+                    now = datetime.now()
+                    window = STATE.get('schedule_window_minutes', 5)
+                    allow = _sanitize_days(STATE.get('news_days', [0, 1, 2, 3, 4]), fallback=[0, 1, 2, 3, 4])
+                    morning_h, morning_m = _parse_hour_minute(STATE.get('news_morning_time', '08:30'), '08:30')
+                    evening_h, evening_m = _parse_hour_minute(STATE.get('news_evening_time', '16:30'), '16:30')
+                    diff = (now - target).total_seconds() / 60
+
+                    if now >= target:
+                        if abs(diff) <= window:
+                            if not STATE.get('news_running'):
+                                STATE['news_running'] = True
+                                # Determine next run: if this was morning, schedule evening today;
+                                # if this was evening, schedule next morning on allowed day
+                                cur_h = target.hour
+                                cur_m = target.minute
+                                if cur_h == morning_h and cur_m == morning_m:
+                                    # Schedule evening run today
+                                    next_run = now.replace(hour=evening_h, minute=evening_m, second=0, microsecond=0)
+                                    if next_run <= now:
+                                        next_run = _next_run_for_days(morning_h, morning_m, allow, now=now + timedelta(minutes=1))
+                                else:
+                                    # Schedule morning run on next allowed day
+                                    next_run = _next_run_for_days(morning_h, morning_m, allow, now=now + timedelta(minutes=1))
+                                STATE['news_scheduled_time'] = next_run
+                                STATE['last_result'] = f"News triggered @ {now.strftime('%Y-%m-%d %H:%M')}"
+                                threading.Thread(target=lambda: run_op_internal('news', scheduled=True), daemon=True).start()
+                        elif diff > window:
+                            # Missed window: schedule next morning on allowed day
+                            next_run = _next_run_for_days(morning_h, morning_m, allow, now=now + timedelta(minutes=1))
+                            STATE['news_scheduled_time'] = next_run
+                            STATE['last_result'] = f"Missed news, next: {next_run.strftime('%Y-%m-%d %H:%M')}"
+
+            time.sleep(30)
+
+    threading.Thread(target=news_scheduler_loop, daemon=True).start()
+
+
 def _start_audit_scheduler_once():
     """Start a single background scheduler loop for audits."""
     global AUDIT_SCHEDULER_STARTED
@@ -3322,6 +3472,8 @@ def run_op_internal(operation, scheduled=False):
                 cmd = [sys.executable, 'src/main.py', '--scan']
         elif operation == 'train':
             cmd = [sys.executable, 'src/main.py', '--train-ml']
+        elif operation == 'news':
+            cmd = [sys.executable, 'src/main.py', '--update-news']
         elif operation == 'qual':
             chunk = STATE.get('qual_chunk_size', 20)
             cmd = [sys.executable, 'scripts/update_qual_features.py', '--count', str(chunk)]
@@ -3593,6 +3745,47 @@ def snapshot_schedule():
     )
 
 
+@app.route('/news_schedule', methods=['POST', 'DELETE'])
+def news_schedule():
+    if request.method == 'DELETE':
+        with STATE_LOCK:
+            STATE['news_scheduled_time'] = None
+        return jsonify({'status': 'cancelled'})
+
+    data = request.get_json() or {}
+    morning_time = data.get('morning_time', '08:30')
+    evening_time = data.get('evening_time', '16:30')
+    days = _sanitize_days(data.get('days', [0, 1, 2, 3, 4]), fallback=[0, 1, 2, 3, 4])
+    morning_h, morning_m = _parse_hour_minute(morning_time, '08:30')
+    evening_h, evening_m = _parse_hour_minute(evening_time, '16:30')
+
+    # Determine next run: whichever is soonest (morning or evening today, or next morning)
+    now = datetime.now()
+    morning_today = now.replace(hour=morning_h, minute=morning_m, second=0, microsecond=0)
+    evening_today = now.replace(hour=evening_h, minute=evening_m, second=0, microsecond=0)
+
+    if now < morning_today and now.weekday() in days:
+        target = morning_today
+    elif now < evening_today and now.weekday() in days:
+        target = evening_today
+    else:
+        target = _next_run_for_days(morning_h, morning_m, days, now=now + timedelta(minutes=1))
+
+    with STATE_LOCK:
+        STATE['news_morning_time'] = f"{morning_h:02d}:{morning_m:02d}"
+        STATE['news_evening_time'] = f"{evening_h:02d}:{evening_m:02d}"
+        STATE['news_days'] = days
+        STATE['news_scheduled_time'] = target
+
+    _start_news_scheduler_once()
+    return jsonify({
+        'status': 'scheduled',
+        'next': target.strftime('%Y-%m-%d %H:%M'),
+        'morning_time': f"{morning_h:02d}:{morning_m:02d}",
+        'evening_time': f"{evening_h:02d}:{evening_m:02d}",
+        'days': days,
+    })
+
 
 @app.route('/audit_schedule', methods=['POST', 'DELETE'])
 def audit_schedule():
@@ -3649,6 +3842,7 @@ def weekly_summary_schedule():
 # Restore persisted scan schedule and ensure schedulers are active on startup.
 _load_scan_schedule_state()
 _start_scan_scheduler_once()
+_start_news_scheduler_once()
 _start_audit_scheduler_once()
 _start_weekly_summary_scheduler_once()
 _start_snapshot_scheduler_once()

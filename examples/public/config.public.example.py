@@ -229,7 +229,11 @@ ML_FEATURE_CONTRACT = [
     'high_close', 'high_low', 'inter_vix_rsi', 'inter_vix_sma200', 'inter_yield_rsi', 'inter_yield_sma200',
     'is_dividend_stock', 'is_month_end', 'is_month_start', 'is_yield_trap', 'low_close',
     'macd', 'macd_hist_slope', 'macd_histogram', 'macd_signal', 'macro_fed_assets_chg', 'macro_hy_spread', 'macro_stress',
-    'macro_vix', 'macro_yield_curve', 'month', 'payout_quality', 'price_vs_52w_high',
+    'macro_vix', 'macro_yield_curve', 'month',
+    # News features (daily market-level from Gemini CLI, signed scale)
+    'news_energy_supply', 'news_event_shock', 'news_geopolitical', 'news_monetary_surprise',
+    'news_regulatory', 'news_risk_chg', 'news_risk_total', 'news_sentiment_net', 'news_trade_policy',
+    'payout_quality', 'price_vs_52w_high',
     # Qualitative features (ordinal)
     'qual_confidence', 'qual_cyclical', 'qual_debt', 'qual_is_etf', 'qual_maturity', 'qual_moat',
     # Qualitative features (industry one-hot)
@@ -254,6 +258,15 @@ ML_FEATURE_CONTRACT = [
     'stoch_overbought', 'stoch_oversold', 'tr', 'volatility_20d', 'volatility_regime',
     'volume_sma_20', 'volume_trend', 'volume_zscore', 'week_of_year'
 ]
+
+# =============================================================================
+# NEWS / MARKET EVENT SETTINGS (Gemini CLI grounded search)
+# =============================================================================
+NEWS_ENABLED = True
+NEWS_CACHE_DIR = os.path.join(PROJECT_ROOT, 'data', 'news_cache')
+GEMINI_NEWS_MODEL = "gemini-3.1-pro-preview" # Pro for quality (only 2 calls/day)
+GEMINI_NEWS_FALLBACK_MODEL = "gemini-3-flash-preview"  # Fallback if primary unavailable
+GEMINI_NEWS_TIMEOUT = 120                    # Seconds per call
 
 # =============================================================================
 # QUALITATIVE FEATURE SETTINGS
