@@ -2185,8 +2185,19 @@ HTML_TEMPLATE = """
                     // Running ops summary
                     const runningOps = document.getElementById('runningOps');
                     let runningList = [];
-                    if (data.scan_running) runningList.push('🔍 Scan');
-                    if (data.train_running) runningList.push('🧠 Train');
+                    if (data.scan_running) {
+                        let lbl = '🔍 Scan';
+                        if (data.scan_eta && data.scan_eta.progress_pct > 0) lbl += ` ${data.scan_eta.progress_pct.toFixed(0)}%`;
+                        runningList.push(lbl);
+                    }
+                    if (data.train_running) {
+                        let lbl = '🧠 Train';
+                        if (data.train_eta) {
+                            const pct = data.train_eta.overall_pct != null ? data.train_eta.overall_pct : data.train_eta.progress_pct;
+                            if (pct > 0) lbl += ` ${pct.toFixed(0)}%`;
+                        }
+                        runningList.push(lbl);
+                    }
                     if (data.qual_running) runningList.push('🏭 Qual');
                     if (data.news_running) runningList.push('📰 News');
                     if (data.audit_running) runningList.push('📋 Audit');
@@ -2210,8 +2221,16 @@ HTML_TEMPLATE = """
                     document.getElementById('stopScanBtn').style.display = data.scan_running ? 'inline-block' : 'none';
                     document.getElementById('scanBtn').disabled = data.scan_running;
                     const staleHint = (data.scan_stale_tickers == null) ? '' : ` · stale used: ${data.scan_stale_tickers}`;
-                    document.getElementById('scanStatus').textContent = data.scan_running ? 'Running...' :
-                        ((data.scan_last_result || '') + staleHint);
+                    if (data.scan_running && data.scan_eta) {
+                        const se = data.scan_eta;
+                        let scanTxt = `Scanning... ${se.progress_pct.toFixed(1)}%`;
+                        if (se.eta_text) scanTxt += ` · ETA: ${se.eta_text}`;
+                        if (se.status_text && se.status_text !== 'Starting...') scanTxt += ` · ${se.status_text}`;
+                        document.getElementById('scanStatus').textContent = scanTxt;
+                    } else {
+                        document.getElementById('scanStatus').textContent = data.scan_running ? 'Running...' :
+                            ((data.scan_last_result || '') + staleHint);
+                    }
                     
                     const scheduleBtn = document.getElementById('scheduleBtn');
                     const cancelBtn = document.getElementById('cancelBtn');
@@ -2242,8 +2261,24 @@ HTML_TEMPLATE = """
                     // Train section
                     document.getElementById('stopTrainBtn').style.display = data.train_running ? 'inline-block' : 'none';
                     document.getElementById('trainBtn').disabled = data.train_running;
-                    document.getElementById('trainStatus').textContent = data.train_running ? 'Running...' : 
-                        (data.train_last_result || '');
+                    if (data.train_running && data.train_eta) {
+                        const te = data.train_eta;
+                        let trainTxt = 'Training...';
+                        if (te.overall_pct != null) {
+                            trainTxt = `Training... ${te.overall_pct.toFixed(1)}%`;
+                            if (te.overall_eta) trainTxt += ` · ETA: ${te.overall_eta}`;
+                        } else if (te.progress_pct > 0) {
+                            trainTxt = `Training... ${te.progress_pct.toFixed(1)}%`;
+                            if (te.eta_text) trainTxt += ` · ETA: ${te.eta_text}`;
+                        } else if (te.eta_text) {
+                            trainTxt = `Training... ETA: ${te.eta_text}`;
+                        }
+                        if (te.status_text && te.status_text !== 'Starting...') trainTxt += ` · ${te.status_text}`;
+                        document.getElementById('trainStatus').textContent = trainTxt;
+                    } else {
+                        document.getElementById('trainStatus').textContent = data.train_running ? 'Running...' :
+                            (data.train_last_result || '');
+                    }
                     
                     const trainScheduleBtn = document.getElementById('trainScheduleBtn');
                     const trainCancelBtn = document.getElementById('trainCancelBtn');
@@ -2938,6 +2973,118 @@ def open_file():
         return jsonify({"status": "error", "message": str(exc)}), 400
 
 
+# ── Operation ETA helpers ──────────────────────────────────────
+
+_STATUS_FILES = {
+    'scan': os.path.join(PROJECT_ROOT, 'SCAN_STATUS.md'),
+    'train': os.path.join(PROJECT_ROOT, 'TRAIN_STATUS.md'),
+}
+_ETA_HISTORY_FILE = os.path.join(PROJECT_ROOT, 'data', 'eta_history.json')
+_ETA_OP_NAMES = {'scan': 'market_scan', 'train': 'ml_training'}
+
+
+def _parse_operation_progress(operation: str) -> dict:
+    """
+    Parse live progress/ETA from an operation's status markdown file.
+    Falls back to historical ETA prediction when the status file is stale.
+    Returns dict with progress_pct, eta_text, status_text, overall_pct, overall_eta.
+    """
+    result = {'progress_pct': 0, 'eta_text': '', 'status_text': 'Starting...', 'overall_pct': None, 'overall_eta': None}
+
+    status_path = _STATUS_FILES.get(operation)
+    if not status_path:
+        return result
+
+    # Try reading the live status file
+    try:
+        mtime = os.path.getmtime(status_path)
+        age_seconds = time.time() - mtime
+        with open(status_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Extract status text: **Status**: ...
+        m = re.search(r'\*\*Status\*\*:\s*(.+?)(?:\s*\||\n)', content)
+        if m:
+            result['status_text'] = m.group(1).strip()
+
+        if operation == 'train':
+            # Training format: **Progress**: `[█░...]` X.X%
+            m = re.search(r'\*\*Progress\*\*:\s*`\[[█░]+\]`\s*([\d.]+)%', content)
+            if m:
+                result['progress_pct'] = float(m.group(1))
+            # Current horizon ETA: **Current Horizon ETA**: **X.X min**
+            m = re.search(r'\*\*Current Horizon ETA\*\*:\s*\*\*(.+?)\*\*', content)
+            if m:
+                result['eta_text'] = m.group(1)
+            # Overall: **Total Progress**: `[█░...]` X.X% (N/M horizons)
+            m = re.search(r'\*\*Total Progress\*\*:\s*`\[[█░]+\]`\s*([\d.]+)%', content)
+            if m:
+                result['overall_pct'] = float(m.group(1))
+            m = re.search(r'\*\*Total ETA Remaining\*\*:\s*\*\*(.+?)\*\*', content)
+            if m:
+                result['overall_eta'] = m.group(1)
+        elif operation == 'scan':
+            # Scan format: ### Progress: X.X% | ETA: **X.X min**
+            m = re.search(r'Progress:\s*([\d.]+)%', content)
+            if m:
+                result['progress_pct'] = float(m.group(1))
+            m = re.search(r'ETA:\s*\*\*(.+?)\*\*', content)
+            if m:
+                result['eta_text'] = m.group(1)
+
+        # If status file is stale (>60s old) and progress is very low, supplement with historical ETA
+        if age_seconds > 60 and result['progress_pct'] <= 1.0:
+            hist_eta = _get_historical_eta(operation)
+            if hist_eta:
+                elapsed = age_seconds
+                remaining = max(0, hist_eta - elapsed)
+                result['eta_text'] = _format_eta_seconds(remaining) + ' (est)'
+                result['status_text'] = 'Preparing data...' if operation == 'train' else 'Loading...'
+
+    except FileNotFoundError:
+        # No status file yet — use historical ETA only
+        hist_eta = _get_historical_eta(operation)
+        if hist_eta:
+            result['eta_text'] = _format_eta_seconds(hist_eta) + ' (est)'
+    except Exception:
+        pass
+
+    return result
+
+
+def _get_historical_eta(operation: str) -> float:
+    """Get predicted duration in seconds from eta_history.json for an operation."""
+    op_name = _ETA_OP_NAMES.get(operation)
+    if not op_name:
+        return None
+    try:
+        with open(_ETA_HISTORY_FILE, 'r') as f:
+            history = json.load(f)
+        past_runs = [r for r in history if r.get('op_name') == op_name and r.get('duration_seconds')]
+        if not past_runs:
+            return None
+        # Weighted average of last 5 runs (recent = higher weight)
+        recent = past_runs[-5:]
+        total_w = sum(i + 1 for i in range(len(recent)))
+        return sum(r['duration_seconds'] * (i + 1) for i, r in enumerate(recent)) / total_w
+    except Exception:
+        return None
+
+
+def _format_eta_seconds(seconds: float) -> str:
+    """Format seconds as human-readable ETA string."""
+    if seconds is None or seconds < 0:
+        return 'unknown'
+    if seconds < 60:
+        return f'{int(seconds)}s'
+    elif seconds < 3600:
+        return f'{seconds / 60:.1f} min'
+    else:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) / 60)
+        return f'{h}h {m}m'
+
+
 @app.route('/status')
 def status():
     # Check for external PID file (synced from remote)
@@ -3000,6 +3147,9 @@ def status():
             'snapshot_last_result': STATE.get('snapshot_last_result'),
             # Legacy
             'last_result': STATE.get('last_result'),
+            # Live ETA / progress for running operations
+            'scan_eta': _parse_operation_progress('scan') if scan_running else None,
+            'train_eta': _parse_operation_progress('train') if STATE.get('train_running') else None,
         })
 
 @app.route('/stop/<operation>', methods=['POST'])
