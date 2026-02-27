@@ -104,15 +104,16 @@ def _load_cache(target_date: date) -> Optional[dict]:
 
 
 def _save_cache(target_date: date, data: dict):
-    """Save news data to cache file."""
+    """Save news data to cache file. Does not mutate the input dict."""
     path = _cache_path(target_date)
-    data['_meta'] = {
+    data_to_save = dict(data)  # Avoid mutating the caller's dict
+    data_to_save['_meta'] = {
         'cached_at': datetime.now().isoformat(),
         'model': GEMINI_NEWS_MODEL,
     }
     try:
         with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
+            json.dump(data_to_save, f, indent=2)
     except Exception as e:
         print(f"[news] Warning: Could not save cache: {e}")
 
@@ -248,6 +249,10 @@ def _run_gemini_once(prompt: str, model: Optional[str] = None) -> Optional[str]:
     cmd = [gemini_bin]
     if model:
         cmd.extend(["-m", model])
+    # Note: prompt is passed as a list element, NOT through shell=True,
+    # so shell injection is not possible — each list element becomes a
+    # separate argv entry.  The prompt content is generated from controlled
+    # inputs (date.isoformat()) and the static template in _generate_prompt().
     cmd.extend(["-p", prompt])
 
     label = model or "default"

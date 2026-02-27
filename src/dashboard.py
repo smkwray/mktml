@@ -3464,6 +3464,14 @@ def schedule():
 
 def run_op_internal(operation, scheduled=False):
     """Run an operation with per-operation process tracking."""
+    # Defensive check: ensure we don't run concurrent operations of the same type.
+    # The scheduler sets *_running = True before spawning this thread, but if the
+    # thread completes very quickly (e.g. immediate failure) there's a narrow window
+    # where another invocation could slip through.
+    with STATE_LOCK:
+        if STATE.get(f'{operation}_running') and PROCESSES.get(operation) is not None:
+            return  # Already running — skip this invocation
+        STATE[f'{operation}_running'] = True
     try:
         if operation == 'scan':
             if scheduled:
