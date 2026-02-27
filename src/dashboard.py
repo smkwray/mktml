@@ -120,6 +120,9 @@ STATE = {
     'scan_running': False,
     'scan_last_run': None,
     'scan_last_result': None,
+    'scan_stale_tickers': None,
+    'scan_failed_fetch_tickers': None,
+    'scan_insufficient_history_tickers': None,
 
     # Training schedule (N-day interval)
     'train_scheduled_time': None, 
@@ -175,6 +178,7 @@ PROCESSES = {
     'snapshot': None,
 }
 PROCESS_LOCK = threading.Lock()
+SCAN_SCHEDULER_STARTED = False
 AUDIT_SCHEDULER_STARTED = False
 WEEKLY_SUMMARY_SCHEDULER_STARTED = False
 SNAPSHOT_SCHEDULER_STARTED = False
@@ -186,6 +190,11 @@ REPORTS_DIR = os.path.join(PROJECT_ROOT, "reports")
 LOGS_DIR = os.path.join(PROJECT_ROOT, "logs")
 DB_PATH = os.path.join(PROJECT_ROOT, "data", "market_data.duckdb")
 CONFIG_HISTORY_PATH = os.path.join(PROJECT_ROOT, "data", "config_history.jsonl")
+SCAN_SCHEDULE_STATE_PATH = os.path.join(PROJECT_ROOT, "data", "scan_schedule_state.json")
+try:
+    SCAN_LOCK_RETRY_MINUTES = max(1, int(os.environ.get("DASHBOARD_SCAN_LOCK_RETRY_MINUTES", "15")))
+except ValueError:
+    SCAN_LOCK_RETRY_MINUTES = 15
 
 EDITABLE_CONFIG_KEYS = (
     "PORTFOLIO_HOLDINGS",
@@ -1494,6 +1503,18 @@ HTML_TEMPLATE = """
                     <label for="denylistInput">Universe Denylist</label>
                     <textarea id="denylistInput" placeholder="TICKERS_TO_EXCLUDE"></textarea>
                 </div>
+                <div class="field" style="grid-column: span 2;">
+                    <label for="purgeTickers">Quick Purge (adds to denylist)</label>
+                    <div class="schedule-row">
+                        <input type="text" id="purgeTickers" placeholder="TICK1, TICK2, TICK3">
+                        <button class="btn btn-danger" onclick="purgeUniverseTickers()">🗑 Purge</button>
+                        <button class="btn btn-secondary" onclick="loadPurgeSuggestions()">💡 Suggest Purge</button>
+                        <button class="btn btn-warning" onclick="purgeSelectedSuggestions()">✅ Purge Selected</button>
+                    </div>
+                    <div id="purgeStatus" class="info"></div>
+                    <div id="purgeSuggestStatus" class="info"></div>
+                    <div id="purgeSuggestions" class="history-list"></div>
+                </div>
                 <div class="field">
                     <label for="confluenceThreshold">Confluence Threshold</label>
                     <input type="number" step="0.01" min="0" max="1" id="confluenceThreshold">
@@ -1739,6 +1760,7 @@ HTML_TEMPLATE = """
                     document.getElementById('horizonTarget30').value = h['30'] ?? 0.080;
                     configLoaded = true;
                     setStatusText('configSaveStatus', 'Config loaded.');
+                    loadPurgeSuggestions();
                 })
                 .catch(err => setStatusText('configSaveStatus', `Load failed: ${err}`, true));
         }
@@ -1778,6 +1800,124 @@ HTML_TEMPLATE = """
                     updateStatus();
                 })
                 .catch(err => setStatusText('configSaveStatus', `Save failed: ${err}`, true));
+        }
+
+        function purgeUniverseTickers() {
+            const raw = document.getElementById('purgeTickers').value || '';
+            const tickers = parseTickerText(raw);
+            if (!tickers.length) {
+                setStatusText('purgeStatus', 'Enter one or more tickers.', true);
+                return;
+            }
+            fetch('/api/universe/purge', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tickers: tickers}),
+            })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'ok') {
+                        setStatusText('purgeStatus', data.message || 'Purge failed', true);
+                        return;
+                    }
+                    const added = (data.added || []).join(', ') || 'none';
+                    setStatusText('purgeStatus', `Purged: ${added}. Denylist size: ${data.total_denylist || 0}`);
+                    document.getElementById('purgeTickers').value = '';
+                    loadConfigEditor();
+                    loadConfigHistory();
+                    updateStatus();
+                    loadPurgeSuggestions();
+                })
+                .catch(err => setStatusText('purgeStatus', `Purge failed: ${err}`, true));
+        }
+
+        function renderPurgeSuggestions(items) {
+            const container = document.getElementById('purgeSuggestions');
+            if (!container) return;
+            if (!Array.isArray(items) || items.length === 0) {
+                container.innerHTML = '<div class="history-item"><div>No candidates right now.</div></div>';
+                return;
+            }
+            container.innerHTML = items.map(item => {
+                const ticker = item.ticker || '';
+                const reasons = Array.isArray(item.reasons) ? item.reasons.join(', ') : '';
+                const vol = (item.avg_volume_20d == null) ? '-' : Number(item.avg_volume_20d).toLocaleString();
+                const dol = (item.avg_dollar_volume_20d == null) ? '-' : Number(item.avg_dollar_volume_20d).toLocaleString();
+                const lastDate = item.last_date || '-';
+                const staleDays = (item.stale_days == null) ? '-' : `${item.stale_days}d`;
+                const preds = (item.pred_rows_60d == null) ? '-' : `${item.pred_rows_60d}`;
+                return `
+                    <div class="history-item">
+                        <div>
+                            <div><label><input type="checkbox" class="purge-suggest-cb" value="${ticker}"> <strong>${ticker}</strong></label></div>
+                            <div class="history-meta">score=${item.score || 0} · reasons: ${reasons}</div>
+                            <div class="history-meta">last=${lastDate} (${staleDays}) · vol20=${vol} · $vol20=${dol} · preds60=${preds}</div>
+                        </div>
+                        <div><button class="btn btn-danger" onclick="purgeUniverseTickersDirect(['${ticker}'])">Purge</button></div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function purgeUniverseTickersDirect(tickers) {
+            const clean = (Array.isArray(tickers) ? tickers : []).map(t => String(t || '').trim().toUpperCase()).filter(Boolean);
+            if (!clean.length) {
+                setStatusText('purgeStatus', 'No tickers selected.', true);
+                return;
+            }
+            fetch('/api/universe/purge', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tickers: clean}),
+            })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'ok' && data.status !== 'noop') {
+                        setStatusText('purgeStatus', data.message || 'Purge failed', true);
+                        return;
+                    }
+                    const added = (data.added || []).join(', ') || 'none';
+                    setStatusText('purgeStatus', `Purged: ${added}. Denylist size: ${data.total_denylist || 0}`);
+                    loadConfigEditor();
+                    loadConfigHistory();
+                    updateStatus();
+                    loadPurgeSuggestions();
+                })
+                .catch(err => setStatusText('purgeStatus', `Purge failed: ${err}`, true));
+        }
+
+        function purgeSelectedSuggestions() {
+            const selected = [];
+            document.querySelectorAll('.purge-suggest-cb').forEach(cb => {
+                if (cb.checked) selected.push(String(cb.value || '').trim().toUpperCase());
+            });
+            purgeUniverseTickersDirect(selected);
+        }
+
+        function loadPurgeSuggestions() {
+            fetch('/api/universe/purge_suggestions?limit=25')
+                .then(r => {
+                    if (r.status === 404) {
+                        return fetch('/api/universe/purge-suggestions?limit=25');
+                    }
+                    return r;
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status !== 'ok') {
+                        setStatusText('purgeSuggestStatus', data.message || 'Failed to load suggestions', true);
+                        renderPurgeSuggestions([]);
+                        return;
+                    }
+                    const count = (data.suggestions || []).length;
+                    const total = data.total_candidates ?? count;
+                    setStatusText('purgeSuggestStatus', `Loaded ${count}/${total} suggestions.`);
+                    renderPurgeSuggestions(data.suggestions || []);
+                })
+                .catch(err => {
+                    setStatusText('purgeSuggestStatus', `Suggest failed: ${err}`, true);
+                    renderPurgeSuggestions([]);
+                });
         }
 
         function loadConfigHistory() {
@@ -2025,8 +2165,9 @@ HTML_TEMPLATE = """
                     // Scan section
                     document.getElementById('stopScanBtn').style.display = data.scan_running ? 'inline-block' : 'none';
                     document.getElementById('scanBtn').disabled = data.scan_running;
-                    document.getElementById('scanStatus').textContent = data.scan_running ? 'Running...' : 
-                        (data.scan_last_result || '');
+                    const staleHint = (data.scan_stale_tickers == null) ? '' : ` · stale used: ${data.scan_stale_tickers}`;
+                    document.getElementById('scanStatus').textContent = data.scan_running ? 'Running...' :
+                        ((data.scan_last_result || '') + staleHint);
                     
                     const scheduleBtn = document.getElementById('scheduleBtn');
                     const cancelBtn = document.getElementById('cancelBtn');
@@ -2162,6 +2303,7 @@ HTML_TEMPLATE = """
         updateStatus();
         if (!configLoaded) loadConfigEditor();
         loadConfigHistory();
+        loadPurgeSuggestions();
         setPreviewText('Select a report/log file', '');
         loadReportFiles();
         loadLogFiles();
@@ -2378,6 +2520,236 @@ def api_config_history():
     return jsonify({"status": "ok", "items": light_rows})
 
 
+@app.route('/api/universe/purge', methods=['POST'])
+def api_universe_purge():
+    """Add one or more tickers to UNIVERSE_DENYLIST via a quick dashboard action."""
+    data = request.get_json(silent=True) or {}
+    raw_tickers = data.get("tickers", [])
+    to_purge = _normalize_ticker_list(raw_tickers)
+    if not to_purge:
+        return jsonify({"status": "error", "message": "No tickers provided."}), 400
+
+    try:
+        before_snapshot = _config_snapshot()
+        existing = _normalize_ticker_list(before_snapshot.get("universe_denylist", []))
+        existing_set = set(existing)
+
+        merged = list(existing)
+        added = []
+        for ticker in to_purge:
+            if ticker in existing_set:
+                continue
+            merged.append(ticker)
+            existing_set.add(ticker)
+            added.append(ticker)
+
+        if not added:
+            return jsonify(
+                {
+                    "status": "noop",
+                    "message": "Tickers already in denylist.",
+                    "added": [],
+                    "total_denylist": len(existing),
+                    "config": before_snapshot,
+                }
+            )
+
+        changed = _update_config_file({"UNIVERSE_DENYLIST": merged})
+        snapshot = _config_snapshot()
+        history_id = int(time.time() * 1000)
+        _append_config_history(
+            {
+                "id": history_id,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "action": "purge_universe",
+                "updated_keys": changed,
+                "added_tickers": added,
+                "before": before_snapshot,
+                "after": snapshot,
+                "remote_addr": request.remote_addr or "",
+            }
+        )
+        with STATE_LOCK:
+            STATE["last_result"] = (
+                f"Universe purge @ {datetime.now().strftime('%Y-%m-%d %H:%M')} "
+                f"(added {len(added)})"
+            )
+        return jsonify(
+            {
+                "status": "ok",
+                "added": added,
+                "total_denylist": len(snapshot.get("universe_denylist", []) or []),
+                "history_id": history_id,
+                "config": snapshot,
+            }
+        )
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+
+
+@app.route('/api/universe/purge_suggestions')
+@app.route('/api/universe/purge-suggestions')
+def api_universe_purge_suggestions():
+    """
+    Suggest tickers to purge from the scan universe based on weak liquidity,
+    stale data, and low model activity.
+    """
+    limit = _safe_int(request.args.get("limit"), 25) or 25
+    limit = max(1, min(200, limit))
+    if not os.path.exists(DB_PATH):
+        return jsonify({"status": "error", "message": "Market DB not found."}), 404
+
+    try:
+        cfg = _load_config_module()
+        portfolio = set(_normalize_ticker_list(getattr(cfg, "PORTFOLIO_HOLDINGS", []) or []))
+        watchlist = set(_normalize_ticker_list(getattr(cfg, "WATCHLIST", []) or []))
+        denylist = set(_normalize_ticker_list(getattr(cfg, "UNIVERSE_DENYLIST", []) or []))
+        safe_assets = set(_normalize_ticker_list(getattr(cfg, "SAFE_ASSET_ALLOWLIST", []) or []))
+        protected = portfolio | watchlist | safe_assets | denylist
+
+        vol_floor_cfg = float(getattr(cfg, "TRADABILITY_MIN_AVG_VOLUME_20D", 300000) or 300000)
+        dollar_floor_cfg = float(getattr(cfg, "TRADABILITY_MIN_AVG_DOLLAR_VOLUME_20D", 5000000) or 5000000)
+        price_floor_cfg = float(getattr(cfg, "TRADABILITY_MIN_PRICE", 3.0) or 3.0)
+
+        volume_floor = max(50000.0, vol_floor_cfg * 0.25)
+        dollar_floor = max(750000.0, dollar_floor_cfg * 0.25)
+        price_floor = max(2.0, price_floor_cfg * 0.67)
+        stale_days_cutoff = 3
+
+        con = duckdb.connect(DB_PATH, read_only=True)
+        query = """
+        WITH ranked AS (
+            SELECT
+                UPPER(ticker) AS ticker,
+                date,
+                close,
+                volume,
+                ROW_NUMBER() OVER (PARTITION BY UPPER(ticker) ORDER BY date DESC) AS rn
+            FROM price_history
+        ),
+        last_bar AS (
+            SELECT ticker, MAX(date) AS last_date
+            FROM ranked
+            GROUP BY ticker
+        ),
+        liq20 AS (
+            SELECT
+                ticker,
+                AVG(close) AS avg_close_20d,
+                AVG(volume) AS avg_volume_20d,
+                AVG(close * volume) AS avg_dollar_volume_20d,
+                COUNT(*) AS bars_20d
+            FROM ranked
+            WHERE rn <= 20
+            GROUP BY ticker
+        ),
+        pred60 AS (
+            SELECT
+                UPPER(ticker) AS ticker,
+                COUNT(*) AS pred_rows_60d
+            FROM model_predictions
+            WHERE asof_date >= current_date - 60
+            GROUP BY UPPER(ticker)
+        )
+        SELECT
+            b.ticker,
+            b.last_date,
+            q.avg_close_20d,
+            q.avg_volume_20d,
+            q.avg_dollar_volume_20d,
+            COALESCE(p.pred_rows_60d, 0) AS pred_rows_60d
+        FROM last_bar b
+        JOIN liq20 q ON q.ticker = b.ticker
+        LEFT JOIN pred60 p ON p.ticker = b.ticker
+        """
+        rows = con.execute(query).fetchall()
+        con.close()
+
+        today = datetime.now().date()
+        suggestions = []
+        for ticker, last_date, avg_close, avg_vol, avg_dollar, pred_rows in rows:
+            symbol = str(ticker or "").upper().strip()
+            if not symbol or symbol in protected:
+                continue
+
+            reasons = []
+            score = 0
+
+            try:
+                stale_days = max((today - last_date).days, 0) if last_date else 999
+            except Exception:
+                stale_days = 999
+            if stale_days > stale_days_cutoff:
+                reasons.append(f"stale_data>{stale_days_cutoff}d")
+                score += 3
+
+            avg_close_val = float(avg_close or 0.0)
+            avg_vol_val = float(avg_vol or 0.0)
+            avg_dollar_val = float(avg_dollar or 0.0)
+            pred_rows_val = int(pred_rows or 0)
+
+            if avg_close_val < price_floor:
+                reasons.append("low_price")
+                score += 2
+            if avg_vol_val < volume_floor:
+                reasons.append("low_volume")
+                score += 2
+            if avg_dollar_val < dollar_floor:
+                reasons.append("low_dollar_volume")
+                score += 3
+            if pred_rows_val == 0:
+                reasons.append("no_recent_predictions")
+                score += 1
+
+            if score < 3:
+                continue
+
+            suggestions.append(
+                {
+                    "ticker": symbol,
+                    "score": int(score),
+                    "reasons": reasons,
+                    "last_date": last_date.strftime("%Y-%m-%d") if last_date else "",
+                    "stale_days": int(stale_days),
+                    "avg_close_20d": avg_close_val,
+                    "avg_volume_20d": avg_vol_val,
+                    "avg_dollar_volume_20d": avg_dollar_val,
+                    "pred_rows_60d": pred_rows_val,
+                }
+            )
+
+        suggestions.sort(
+            key=lambda x: (
+                -int(x.get("score", 0)),
+                float(x.get("avg_dollar_volume_20d", 0.0)),
+                float(x.get("avg_volume_20d", 0.0)),
+                x.get("ticker", ""),
+            )
+        )
+        return jsonify(
+            {
+                "status": "ok",
+                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "thresholds": {
+                    "price_floor": price_floor,
+                    "volume_floor": volume_floor,
+                    "dollar_volume_floor": dollar_floor,
+                    "stale_days_cutoff": stale_days_cutoff,
+                },
+                "excluded_counts": {
+                    "portfolio": len(portfolio),
+                    "watchlist": len(watchlist),
+                    "safe_assets": len(safe_assets),
+                    "denylist": len(denylist),
+                },
+                "total_candidates": len(suggestions),
+                "suggestions": suggestions[:limit],
+            }
+        )
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
 @app.route('/api/config/rollback', methods=['POST'])
 def api_config_rollback():
     """Rollback config to the 'before' snapshot of a history entry."""
@@ -2508,6 +2880,9 @@ def status():
             'scan_days': STATE.get('scan_days', []),
             'scan_interval_hours': STATE.get('scan_interval_hours', 0),
             'scan_last_result': STATE.get('scan_last_result'),
+            'scan_stale_tickers': STATE.get('scan_stale_tickers'),
+            'scan_failed_fetch_tickers': STATE.get('scan_failed_fetch_tickers'),
+            'scan_insufficient_history_tickers': STATE.get('scan_insufficient_history_tickers'),
             # Train
             'train_scheduled_time': STATE['train_scheduled_time'].strftime('%Y-%m-%d %H:%M') if STATE.get('train_scheduled_time') else None,
             'train_interval_days': STATE.get('train_interval_days', 10),
@@ -2604,6 +2979,9 @@ def run_scan():
         if STATE.get('scan_running'):
             return jsonify({'error': 'Scan already running'}), 400
         STATE['scan_running'] = True
+        STATE['scan_stale_tickers'] = None
+        STATE['scan_failed_fetch_tickers'] = None
+        STATE['scan_insufficient_history_tickers'] = None
     
     threading.Thread(target=lambda: run_op_internal('scan', scheduled=False), daemon=True).start()
     return jsonify({'status': 'started', 'operation': 'scan'})
@@ -2682,6 +3060,105 @@ def get_next_valid_time(target_dt, days_interval=1, allowed_days=None):
         next_run += timedelta(days=1)
     
     return next_run # Fallback if loop exhausted
+
+
+def _persist_scan_schedule_locked():
+    """Persist scan schedule settings so restarts do not drop the schedule."""
+    payload = {
+        "scheduled_time": (
+            STATE["scheduled_time"].strftime("%Y-%m-%d %H:%M:%S")
+            if STATE.get("scheduled_time")
+            else None
+        ),
+        "scan_days": _sanitize_days(STATE.get("scan_days", [0, 1, 2, 3, 4]), fallback=[0, 1, 2, 3, 4]),
+        "scan_interval_hours": max(0, int(STATE.get("scan_interval_hours", 0) or 0)),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    os.makedirs(os.path.dirname(SCAN_SCHEDULE_STATE_PATH), exist_ok=True)
+    tmp_path = f"{SCAN_SCHEDULE_STATE_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, separators=(",", ":"))
+    os.replace(tmp_path, SCAN_SCHEDULE_STATE_PATH)
+
+
+def _load_scan_schedule_state():
+    """Restore persisted scan schedule settings on startup."""
+    if not os.path.exists(SCAN_SCHEDULE_STATE_PATH):
+        return
+
+    try:
+        with open(SCAN_SCHEDULE_STATE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return
+
+    target = None
+    raw_target = raw.get("scheduled_time")
+    if isinstance(raw_target, str) and raw_target.strip():
+        for dt_fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                target = datetime.strptime(raw_target.strip(), dt_fmt)
+                break
+            except ValueError:
+                continue
+
+    days = _sanitize_days(raw.get("scan_days", [0, 1, 2, 3, 4]), fallback=[0, 1, 2, 3, 4])
+    try:
+        interval_hours = max(0, int(raw.get("scan_interval_hours", 0) or 0))
+    except Exception:
+        interval_hours = 0
+
+    with STATE_LOCK:
+        STATE["scheduled_time"] = target
+        STATE["scan_days"] = days
+        STATE["scan_interval_hours"] = interval_hours
+
+
+def _start_scan_scheduler_once():
+    """Start a single background scheduler loop for scans."""
+    global SCAN_SCHEDULER_STARTED
+    if SCAN_SCHEDULER_STARTED:
+        return
+    SCAN_SCHEDULER_STARTED = True
+
+    def scan_scheduler_loop():
+        while True:
+            should_trigger = False
+            with STATE_LOCK:
+                target = STATE.get("scheduled_time")
+                if target is not None:
+                    now = datetime.now()
+                    window = STATE.get("schedule_window_minutes", 5)
+                    allow = _sanitize_days(STATE.get("scan_days", [0, 1, 2, 3, 4]), fallback=[0, 1, 2, 3, 4])
+                    interval = max(0, int(STATE.get("scan_interval_hours", 0) or 0))
+
+                    diff = (now - target).total_seconds() / 60
+                    if now >= target:
+                        if abs(diff) <= window:
+                            if not STATE.get("scan_running"):
+                                STATE["scan_running"] = True
+                                if interval > 0:
+                                    next_run = now + timedelta(hours=interval)
+                                else:
+                                    next_run = get_next_valid_time(target, 1, allow)
+                                STATE["scheduled_time"] = next_run
+                                STATE["last_result"] = f"Scan triggered @ {now.strftime('%Y-%m-%d %H:%M')}"
+                                _persist_scan_schedule_locked()
+                                should_trigger = True
+                        elif diff > window:
+                            if interval > 0:
+                                next_run = now + timedelta(hours=interval)
+                            else:
+                                next_run = get_next_valid_time(target, 1, allow)
+                            STATE["scheduled_time"] = next_run
+                            STATE["last_result"] = f"Missed scan, next: {next_run.strftime('%Y-%m-%d %H:%M')}"
+                            _persist_scan_schedule_locked()
+
+            if should_trigger:
+                threading.Thread(target=lambda: run_op_internal("scan", scheduled=True), daemon=True).start()
+            time.sleep(30)
+
+    threading.Thread(target=scan_scheduler_loop, daemon=True).start()
 
 
 def _start_audit_scheduler_once():
@@ -2803,14 +3280,18 @@ def schedule():
     if request.method == 'DELETE':
         with STATE_LOCK:
             STATE['scheduled_time'] = None
+            _persist_scan_schedule_locked()
         return jsonify({'status': 'cancelled'})
     
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     time_str = data.get('time', '09:30')
-    allowed_days = data.get('days', [0,1,2,3,4])
-    interval_hours = data.get('interval_hours', 0)  # 0 = daily only
+    allowed_days = _sanitize_days(data.get('days', [0, 1, 2, 3, 4]), fallback=[0, 1, 2, 3, 4])
+    try:
+        interval_hours = max(0, int(data.get('interval_hours', 0) or 0))  # 0 = daily only
+    except Exception:
+        interval_hours = 0
     
-    hour, minute = map(int, time_str.split(':'))
+    hour, minute = _parse_hour_minute(time_str, default='09:30')
     
     now = datetime.now()
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
@@ -2825,46 +3306,9 @@ def schedule():
         STATE['scheduled_time'] = target
         STATE['scan_days'] = allowed_days
         STATE['scan_interval_hours'] = interval_hours
-    
-    def scheduler_loop():
-        while True:
-            with STATE_LOCK:
-                if STATE['scheduled_time'] is None:
-                    return
-                
-                now = datetime.now()
-                target = STATE['scheduled_time']
-                window = STATE['schedule_window_minutes']
-                allow = STATE.get('scan_days', [0,1,2,3,4])
-                interval = STATE.get('scan_interval_hours', 0)
-                
-                diff = (now - target).total_seconds() / 60
-                
-                if now >= target:
-                    if abs(diff) <= window:
-                        if not STATE.get('scan_running'):
-                            STATE['scan_running'] = True
-                            
-                            # Next run: interval hours if set, else next day
-                            if interval > 0:
-                                next_run = now + timedelta(hours=interval)
-                            else:
-                                next_run = get_next_valid_time(target, 1, allow)
-                            STATE['scheduled_time'] = next_run
-                            STATE['last_result'] = f"Scan triggered @ {now.strftime('%Y-%m-%d %H:%M')}"
-                            
-                            threading.Thread(target=lambda: run_op_internal('scan', scheduled=True), daemon=True).start()
-                    elif diff > window:
-                        if interval > 0:
-                            next_run = now + timedelta(hours=interval)
-                        else:
-                            next_run = get_next_valid_time(target, 1, allow)
-                        STATE['scheduled_time'] = next_run
-                        STATE['last_result'] = f"Missed scan, next: {next_run.strftime('%Y-%m-%d %H:%M')}"
-            
-            time.sleep(30)
-    
-    threading.Thread(target=scheduler_loop, daemon=True).start()
+        _persist_scan_schedule_locked()
+
+    _start_scan_scheduler_once()
     return jsonify({'status': 'scheduled', 'time': target.strftime('%Y-%m-%d %H:%M')})
 
 
@@ -2908,15 +3352,37 @@ def run_op_internal(operation, scheduled=False):
         stdout_text = stdout.decode('utf-8', errors='ignore') if isinstance(stdout, (bytes, bytearray)) else str(stdout or '')
         stderr_text = stderr.decode('utf-8', errors='ignore') if isinstance(stderr, (bytes, bytearray)) else str(stderr or '')
         combined_text = f"{stdout_text}\n{stderr_text}".strip()
+        scan_meta_match = None
+        if operation == 'scan':
+            scan_meta_match = re.search(
+                r"SCAN_META\s+total_tickers=(\d+)\s+results_generated=(\d+)\s+"
+                r"stale_tickers=(\d+)\s+failed_fetch_tickers=(\d+)\s+insufficient_history_tickers=(\d+)",
+                combined_text,
+            )
         
         with STATE_LOCK:
             STATE[f'{operation}_running'] = False
             if operation == 'snapshot':
                 STATE['snapshot_last_run'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if operation == 'scan':
+                if scan_meta_match:
+                    STATE['scan_stale_tickers'] = int(scan_meta_match.group(3))
+                    STATE['scan_failed_fetch_tickers'] = int(scan_meta_match.group(4))
+                    STATE['scan_insufficient_history_tickers'] = int(scan_meta_match.group(5))
+                else:
+                    STATE['scan_stale_tickers'] = None
+                    STATE['scan_failed_fetch_tickers'] = None
+                    STATE['scan_insufficient_history_tickers'] = None
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
             op_label = operation.replace('_', ' ').title()
             if returncode == 0:
                 result_msg = f"{op_label} OK @ {timestamp}"
+                if operation == 'scan' and scan_meta_match:
+                    result_msg = (
+                        f"{op_label} OK @ {timestamp} "
+                        f"(stale={int(scan_meta_match.group(3))}, "
+                        f"fetch_failures={int(scan_meta_match.group(4))})"
+                    )
                 if operation == 'qual':
                     if 'All tickers up to date!' in combined_text:
                         result_msg = f"{op_label} OK @ {timestamp} (no stale tickers)"
@@ -2927,12 +3393,26 @@ def run_op_internal(operation, scheduled=False):
                 elif operation == 'weekly_summary' and 'No notification channels configured' in combined_text:
                     result_msg = f"{op_label} OK @ {timestamp} (no channels configured)"
             else:
-                hint = ''
-                for line in reversed([ln.strip() for ln in combined_text.splitlines() if ln.strip()]):
-                    if line:
-                        hint = line[:100]
-                        break
-                result_msg = f"{op_label} FAILED @ {timestamp}" + (f" ({hint})" if hint else "")
+                lock_conflict = (
+                    operation == 'scan'
+                    and scheduled
+                    and 'Could not set lock on file' in combined_text
+                )
+                if lock_conflict:
+                    retry_at = datetime.now() + timedelta(minutes=SCAN_LOCK_RETRY_MINUTES)
+                    STATE['scheduled_time'] = retry_at
+                    _persist_scan_schedule_locked()
+                    result_msg = (
+                        f"Scan deferred @ {timestamp} "
+                        f"(DB busy; retry {retry_at.strftime('%Y-%m-%d %H:%M')})"
+                    )
+                else:
+                    hint = ''
+                    for line in reversed([ln.strip() for ln in combined_text.splitlines() if ln.strip()]):
+                        if line:
+                            hint = line[:100]
+                            break
+                    result_msg = f"{op_label} FAILED @ {timestamp}" + (f" ({hint})" if hint else "")
             STATE[f'{operation}_last_result'] = result_msg
             STATE['last_result'] = result_msg
         
@@ -3166,7 +3646,9 @@ def weekly_summary_schedule():
     })
 
 
-# Ensure default audit + weekly summary schedulers are active on startup.
+# Restore persisted scan schedule and ensure schedulers are active on startup.
+_load_scan_schedule_state()
+_start_scan_scheduler_once()
 _start_audit_scheduler_once()
 _start_weekly_summary_scheduler_once()
 _start_snapshot_scheduler_once()

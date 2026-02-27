@@ -117,6 +117,26 @@ def _hours_since(iso_timestamp: str) -> float:
         return float('inf')  # Treat invalid timestamps as infinitely old
 
 
+def _normalize_dividend_yield(value: Any) -> float:
+    """
+    Normalize dividend yield to decimal format (e.g. 4.8% -> 0.048).
+
+    Accepts common malformed inputs like 4.8 or 480 and rescales to decimal.
+    """
+    try:
+        yld = float(value or 0.0)
+    except Exception:
+        return 0.0
+    if not np.isfinite(yld) or yld <= 0:
+        return 0.0
+    # Rescale percentage-style inputs (e.g. 4.8, 480) into decimal form.
+    for _ in range(3):
+        if yld <= 1.0:
+            break
+        yld = yld / 100.0
+    return max(0.0, yld)
+
+
 def _load_external_yields() -> dict:
     """Load external yields from JSON file. Returns empty dict on any failure."""
     global _EXTERNAL_YIELDS_CACHE
@@ -130,7 +150,11 @@ def _load_external_yields() -> dict:
                 data = json.load(f)
             yields = data.get('yields', {})
             # Normalize keys to uppercase
-            _EXTERNAL_YIELDS_CACHE = {k.upper(): float(v) for k, v in yields.items() if v}
+            _EXTERNAL_YIELDS_CACHE = {
+                k.upper(): _normalize_dividend_yield(v)
+                for k, v in yields.items()
+                if v
+            }
             return _EXTERNAL_YIELDS_CACHE
     except Exception as e:
         print(f"  [yields] Warning: Could not load {SAFE_ASSET_YIELDS_FILE}: {e}")
@@ -512,7 +536,7 @@ def _is_safe_asset(ticker: str, atr_ratio: float, dividend_yield: float, benchma
 
     try:
         atr_val = float(atr_ratio)
-        div_val = float(dividend_yield)
+        div_val = _normalize_dividend_yield(dividend_yield)
     except (TypeError, ValueError):
         return (False, "bad_numeric") if return_reason else False
 
@@ -653,11 +677,13 @@ def update_live_status(current_chunk: int, total_chunks: int, processed_tickers:
     top_buys = sorted(buy_candidates, key=lambda x: x.get('confidence', 0), reverse=True)[:15]
 
     # Stats Summary
+    stale_in_results = sum(1 for r in results_to_display if bool(r.get('data_stale')))
     content.append(f"### Statistics")
     content.append(f"- 🟢 Buy Candidates: {len(buy_candidates)} ({len(top_buys)} shown)")
     content.append(f"- ⚪ Holds: {len(holds)}")
     content.append(f"- 🛡️ Safe Assets: {len(safe_assets)}")
     content.append(f"- 💼 Portfolio: {len(portfolio_signals)}")
+    content.append(f"- 🕒 Stale Data Used: {stale_in_results}")
     content.append(f"- 🔴 Sells: {len(sells)}\n")
     
     content.append(f"### ℹ️ Signal Legend")
@@ -716,7 +742,7 @@ def update_live_status(current_chunk: int, total_chunks: int, processed_tickers:
             f.write("| Ticker | Price | Yield | 30d Ret | Spread | Vol | Safety |\n")
             f.write("|--------|-------|-------|---------|--------|-----|--------|\n")
             for sa in sorted(safe_assets, key=lambda x: x.get('dividend_yield', 0), reverse=True)[:15]:
-                yld = sa.get('dividend_yield', 0) or 0
+                yld = _normalize_dividend_yield(sa.get('dividend_yield', 0) or 0)
                 yld_val = f"{yld*100:.2f}%"
                 ret_30d = sa.get('returns_30d')
                 ret_val = f"{ret_30d:.2%}" if isinstance(ret_30d, (int, float)) else "N/A"
@@ -1013,13 +1039,22 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
                          if fund_data.get('source') != 'none':
                              save_fundamentals(ticker, fund_data)
                     
-                    div_yield = fund_data.get('dividend_yield', 0)
+                    raw_db_yield = fund_data.get('dividend_yield', 0)
+                    div_yield = _normalize_dividend_yield(raw_db_yield)
+                    try:
+                        raw_db_float = float(raw_db_yield)
+                    except Exception:
+                        raw_db_float = 0.0
+                    if raw_db_float > 0 and abs(div_yield - raw_db_float) > 1e-9:
+                        fund_data['dividend_yield'] = div_yield
+                        save_fundamentals(ticker, fund_data)
                     if ticker.upper() in SAFE_ASSET_ALLOWSET:
                         hist_yield = estimate_dividend_yield_from_history(
                             ticker,
                             SAFE_ASSET_TRAILING_DIVIDEND_DAYS,
                             SAFE_ASSET_MAX_DIVIDEND_AGE_DAYS,
                         )
+                        hist_yield = _normalize_dividend_yield(hist_yield)
                         if hist_yield and hist_yield > div_yield:
                             div_yield = hist_yield
                             fund_data['dividend_yield'] = div_yield
@@ -1028,7 +1063,7 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
                     # Fallback to external yields file if API failed
                     if div_yield <= 0 and ticker.upper() in SAFE_ASSET_ALLOWSET:
                         ext_yields = _load_external_yields()
-                        ext_yield = ext_yields.get(ticker.upper(), 0)
+                        ext_yield = _normalize_dividend_yield(ext_yields.get(ticker.upper(), 0))
                         if ext_yield > 0:
                             print(f"  [yields] Using external yield {ext_yield:.2%} for {ticker}")
                             div_yield = ext_yield
@@ -1271,8 +1306,17 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
         print(f"Could not print API stats: {e}", flush=True)
     
     stop_logging()
-    print("Scan complete.", flush=True)
     scan_meta = _current_scan_meta()
+    print(
+        "SCAN_META "
+        f"total_tickers={scan_meta.get('total_tickers', 0)} "
+        f"results_generated={scan_meta.get('results_generated', 0)} "
+        f"stale_tickers={scan_meta.get('stale_tickers', 0)} "
+        f"failed_fetch_tickers={scan_meta.get('failed_fetch_tickers', 0)} "
+        f"insufficient_history_tickers={scan_meta.get('insufficient_history_tickers', 0)}",
+        flush=True,
+    )
+    print("Scan complete.", flush=True)
     if return_meta:
         return all_results, scan_meta
     return all_results
@@ -1327,6 +1371,7 @@ def _load_replay_dividend_context(
     if not hist_df.empty:
         hist_df['date'] = pd.to_datetime(hist_df['date'], errors='coerce').dt.normalize()
         hist_df['dividend_yield'] = pd.to_numeric(hist_df['dividend_yield'], errors='coerce')
+        hist_df['dividend_yield'] = hist_df['dividend_yield'].apply(_normalize_dividend_yield)
         hist_df = hist_df.dropna(subset=['date', 'ticker']).sort_values(['ticker', 'date'])
         for ticker, grp in hist_df.groupby('ticker', sort=False):
             dates = grp['date'].to_numpy(dtype='datetime64[ns]')
@@ -1341,7 +1386,7 @@ def _load_replay_dividend_context(
             if not ticker:
                 continue
             try:
-                div_yield = float(row.get('dividend_yield', 0) or 0)
+                div_yield = _normalize_dividend_yield(row.get('dividend_yield', 0) or 0)
             except Exception:
                 div_yield = 0.0
             fundamentals_cache[ticker] = {
@@ -1371,7 +1416,7 @@ def _resolve_replay_dividend_info(
             pos = int(np.searchsorted(dates, asof_np, side='right')) - 1
             if pos >= 0 and pos < len(yields):
                 try:
-                    div_yield = float(yields[pos] or 0.0)
+                    div_yield = _normalize_dividend_yield(yields[pos] or 0.0)
                 except Exception:
                     div_yield = 0.0
 
@@ -1381,7 +1426,7 @@ def _resolve_replay_dividend_info(
             updated_at = pd.to_datetime(fund_ctx.get('updated_at'), errors='coerce')
             if pd.notna(updated_at) and updated_at.normalize() <= asof_date:
                 try:
-                    div_yield = float(fund_ctx.get('dividend_yield', 0) or 0.0)
+                    div_yield = _normalize_dividend_yield(fund_ctx.get('dividend_yield', 0) or 0.0)
                 except Exception:
                     div_yield = 0.0
 
@@ -1421,7 +1466,7 @@ def _apply_replay_context_to_feature_row(
     row['inter_yield_sma200'] = macro_yield_curve * dist_sma_200
     row['inter_yield_rsi'] = macro_yield_curve * rsi
 
-    div_yield = float(dividend_info.get('dividend_yield', 0) or 0)
+    div_yield = _normalize_dividend_yield(dividend_info.get('dividend_yield', 0) or 0)
     row['dividend_yield'] = div_yield
     row['is_dividend_stock'] = 1 if dividend_info.get('is_dividend') else 0
     days_to_ex_div = dividend_info.get('days_to_ex_div')

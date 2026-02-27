@@ -33,7 +33,9 @@ def _normalize_dividend_yield(value) -> float:
     yld = _to_float(value, 0.0)
     if yld < 0:
         return 0.0
-    if yld > 1.0:
+    for _ in range(3):
+        if yld <= 1.0:
+            break
         yld = yld / 100.0
     return max(0.0, yld)
 

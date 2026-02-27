@@ -6,6 +6,21 @@ import numpy as np
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'market_data.duckdb')
 
 
+def _normalize_dividend_yield(value) -> float:
+    """Normalize dividend yield to decimal format."""
+    try:
+        yld = float(value or 0.0)
+    except Exception:
+        return 0.0
+    if not np.isfinite(yld) or yld <= 0:
+        return 0.0
+    for _ in range(3):
+        if yld <= 1.0:
+            break
+        yld = yld / 100.0
+    return max(0.0, yld)
+
+
 def _get_universe_denyset() -> set:
     """Load configured ticker denylist for write-time filtering."""
     import sys
@@ -182,6 +197,7 @@ def save_fundamentals(ticker: str, data: dict):
     """Saves or updates ticker fundamentals."""
     if not data:
         return
+    dividend_yield = _normalize_dividend_yield(data.get('dividend_yield', 0))
     con = get_connection()
     try:
         # Use INSERT OR REPLACE
@@ -190,7 +206,7 @@ def save_fundamentals(ticker: str, data: dict):
             VALUES (?, ?, ?, ?, ?, ?, current_timestamp)
         """, [
             ticker, 
-            data.get('dividend_yield', 0), 
+            dividend_yield,
             data.get('pe_ratio', 0), 
             data.get('market_cap', 0),
             data.get('sector'),
@@ -207,7 +223,9 @@ def get_fundamentals(ticker: str) -> dict:
     try:
         res = con.execute("SELECT * FROM fundamentals WHERE ticker = ?", [ticker]).df()
         if not res.empty:
-            return res.iloc[0].to_dict()
+            out = res.iloc[0].to_dict()
+            out['dividend_yield'] = _normalize_dividend_yield(out.get('dividend_yield', 0))
+            return out
         return {}
     except Exception:
         return {}

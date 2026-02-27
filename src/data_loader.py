@@ -10,6 +10,7 @@ import re
 import io
 import shutil
 import subprocess
+from zoneinfo import ZoneInfo
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -52,6 +53,25 @@ def _next_alpha_vantage_key() -> str:
         key = _ALPHA_VANTAGE_KEYS[_ALPHAVANTAGE_KEY_INDEX % len(_ALPHA_VANTAGE_KEYS)]
         _ALPHAVANTAGE_KEY_INDEX += 1
     return key
+
+
+def _normalize_dividend_yield(value) -> float:
+    """
+    Normalize yield to decimal form (e.g. 4.8% -> 0.048).
+
+    Handles percent-style inputs like 4.8 or 480 from heterogeneous APIs.
+    """
+    try:
+        yld = float(value or 0.0)
+    except Exception:
+        return 0.0
+    if yld <= 0:
+        return 0.0
+    for _ in range(3):
+        if yld <= 1.0:
+            break
+        yld = yld / 100.0
+    return max(0.0, yld)
 
 # =============================================================================
 # RATE LIMITER & CIRCUIT BREAKER
@@ -198,7 +218,7 @@ def _normalize_ohlcv_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = out[required].copy()
-    out['date'] = pd.to_datetime(out['date'], errors='coerce')
+    out['date'] = pd.to_datetime(out['date'], errors='coerce', utc=True).dt.tz_convert(None).dt.normalize()
     out = out.dropna(subset=['date'])
     if out.empty:
         return pd.DataFrame()
@@ -212,6 +232,44 @@ def _normalize_ohlcv_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     out['ticker'] = ticker
     out = out.sort_values('date').drop_duplicates(subset=['date'], keep='last').reset_index(drop=True)
     return out[['date', 'open', 'high', 'low', 'close', 'volume', 'ticker']]
+
+
+def _latest_expected_price_date() -> pd.Timestamp:
+    """
+    Return expected freshest trading date in US/Eastern.
+    Weekend dates are rolled back to Friday.
+    """
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    d = now_et.date()
+    while d.weekday() >= 5:  # Sat/Sun -> previous business day
+        d -= timedelta(days=1)
+    return pd.Timestamp(d).normalize()
+
+
+def _latest_date_for_ticker(df: pd.DataFrame, ticker: str) -> pd.Timestamp | None:
+    """Return normalized latest date for a ticker in a mixed batch frame."""
+    if df is None or df.empty or "ticker" not in df.columns or "date" not in df.columns:
+        return None
+    try:
+        sub = df[df["ticker"].astype(str).str.upper() == str(ticker).upper()]
+        if sub.empty:
+            return None
+        return pd.to_datetime(sub["date"], errors="coerce").max().normalize()
+    except Exception:
+        return None
+
+
+def _latest_date_from_df(df: pd.DataFrame) -> pd.Timestamp | None:
+    """Return normalized latest date from a single-ticker frame."""
+    if df is None or df.empty or "date" not in df.columns:
+        return None
+    try:
+        max_dt = pd.to_datetime(df["date"], errors="coerce").max()
+        if pd.isna(max_dt):
+            return None
+        return max_dt.normalize()
+    except Exception:
+        return None
 
 
 def _extract_json_blob(text: str) -> str:
@@ -1023,150 +1081,170 @@ def download_batch_with_fallback(tickers: list) -> pd.DataFrame:
            -> alpha vantage -> fmp -> eodhd -> gemini-cli (last-ditch)
     """
     from concurrent.futures import ThreadPoolExecutor
-    
+
+    requested = [str(t).upper() for t in (tickers or []) if str(t).strip()]
+    if not requested:
+        return pd.DataFrame()
+
+    target_fresh_date = _latest_expected_price_date()
+
     # 1. Try yfinance batch (Fastest) - if available
     batch_df = pd.DataFrame()
     batch_tickers = set()
-    
+    batch_latest_by_ticker: dict[str, pd.Timestamp | None] = {}
+
     if _CB_YFINANCE.allow_request():
-        print(f"  Attempting yfinance batch for {len(tickers)} tickers...")
+        print(f"  Attempting yfinance batch for {len(requested)} tickers...")
         try:
-            batch_df = download_batch(tickers)
+            batch_df = download_batch(requested)
             if not batch_df.empty:
-                batch_tickers = set(batch_df['ticker'].unique())
-                success_rate = len(batch_tickers) / len(tickers)
-                print(f"  yfinance batch: {len(batch_tickers)}/{len(tickers)} ({success_rate:.0%}) succeeded")
+                if "ticker" in batch_df.columns:
+                    batch_df["ticker"] = batch_df["ticker"].astype(str).str.upper()
+                batch_tickers = set(batch_df["ticker"].unique()) if "ticker" in batch_df.columns else set()
+                success_rate = len(batch_tickers) / len(requested)
+                print(f"  yfinance batch: {len(batch_tickers)}/{len(requested)} ({success_rate:.0%}) succeeded")
                 _CB_YFINANCE.record_success()
-                
-                # Add backoff if batch had low success rate (rate limiting detected)
+
                 if success_rate < 0.5:
                     print("  Rate limit detected, backing off 30s...")
                     time.sleep(30)
-                
-                # If all tickers succeeded, return immediately 
-                if len(batch_tickers) >= len(tickers):
-                    return batch_df
             else:
                 _CB_YFINANCE.record_failure()
-                 
         except Exception as e:
             _CB_YFINANCE.record_failure()
             print(f"  yfinance batch failed: {e}")
-    
-    # 2. Identify missing tickers and use parallel fallback for those only
-    missing_tickers = [t for t in tickers if t not in batch_tickers]
-    
-    if missing_tickers:
-        print(f"  {len(missing_tickers)} tickers missing. Attempting individual fallback...")
-    
+
+    for ticker in requested:
+        batch_latest_by_ticker[ticker] = _latest_date_for_ticker(batch_df, ticker)
+
+    missing_tickers = [t for t in requested if t not in batch_tickers]
+    stale_batch_tickers = [
+        t
+        for t in requested
+        if t in batch_tickers
+        and (batch_latest_by_ticker.get(t) is None or batch_latest_by_ticker[t] < target_fresh_date)
+    ]
+    stale_batch_set = set(stale_batch_tickers)
+
+    print(
+        f"  [debug] Batch size: {len(requested)} | Success: {len(batch_tickers)} | "
+        f"Missing: {len(missing_tickers)} | Stale-vs-target({target_fresh_date.date()}): {len(stale_batch_tickers)}",
+        flush=True,
+    )
+
+    fallback_tickers = []
+    seen = set()
+    for ticker in missing_tickers + stale_batch_tickers:
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        fallback_tickers.append(ticker)
+
     all_dfs = [batch_df] if not batch_df.empty else []
-    recovered_tickers = batch_tickers.copy()
-    
-    missing_tickers = [t for t in tickers if t not in batch_tickers]
-    print(f"  [debug] Batch size: {len(tickers)} | Success: {len(batch_tickers)} | Missing: {len(missing_tickers)}", flush=True)
+    recovered_tickers = set(batch_tickers)
 
-    if missing_tickers:
-        print(f"  [debug] Starting fallbacks for: {missing_tickers[:5]}...", flush=True)
+    if fallback_tickers:
+        print(f"  [debug] Starting fallbacks for: {fallback_tickers[:8]}...", flush=True)
 
-    def fetch_single_smart(ticker):
-        """Try APIs in order, respecting rate limits."""
-        # Add staggered delay to prevent parallel API exhaustion
+    def fetch_single_smart(ticker: str):
+        """Try APIs in order; for stale tickers keep going until fresher data if possible."""
+        require_fresh = ticker in stale_batch_set
+        best_df = pd.DataFrame()
+        best_date = batch_latest_by_ticker.get(ticker)
+
+        def consider_candidate(df: pd.DataFrame) -> pd.DataFrame | None:
+            nonlocal best_df, best_date
+            if df is None or df.empty:
+                return None
+            cand_date = _latest_date_from_df(df)
+            if cand_date is None:
+                return None
+
+            if best_date is None or cand_date > best_date:
+                best_df = df
+                best_date = cand_date
+
+            if not require_fresh or cand_date >= target_fresh_date:
+                return df
+            return None
+
+        # Add staggered delay to prevent parallel API exhaustion.
         time.sleep(random.uniform(0.1, 0.5))
-        
-        # yfinance single
-        if _CB_YFINANCE.allow_request():
+
+        # Skip yfinance single for stale refresh requests; it is usually same as batch.
+        if not require_fresh and _CB_YFINANCE.allow_request():
             try:
                 res = split_and_download_ticker(ticker)
                 if not res.empty:
                     _CB_YFINANCE.record_success()
-                    return res
-            except Exception as e:
+                    accepted = consider_candidate(res)
+                    if accepted is not None:
+                        return ticker, accepted
+            except Exception:
                 _CB_YFINANCE.record_failure()
-        
-        # Alpaca (High Speed: 200/min)
+
         print(f"  [debug] Trying Alpaca for {ticker}", flush=True)
-        res = download_from_alpaca(ticker)
-        if not res.empty:
-            return res
+        for fetch in (
+            download_from_alpaca,
+            download_from_tiingo,
+            download_from_stooq,
+            download_from_twelve_data,
+            download_from_finnhub,
+            download_from_polygon,
+            download_from_fmp,
+            download_from_eodhd,
+        ):
+            res = fetch(ticker)
+            accepted = consider_candidate(res)
+            if accepted is not None:
+                return ticker, accepted
 
-        # Tiingo (Medium Speed: 500/hr)
-        res = download_from_tiingo(ticker)
-        if not res.empty:
-            return res
+        # Alpha Vantage before Gemini for one more direct API attempt.
+        if _CB_ALPHAVANTAGE.allow_request():
+            res = download_from_alpha_vantage(ticker)
+            accepted = consider_candidate(res)
+            if accepted is not None:
+                return ticker, accepted
 
-        # Stooq (checks CB internally)
-        res = download_from_stooq(ticker)
-        if not res.empty:
-            return res
-            
-        # Twelve Data (checks CB & TokenBucket)
-        res = download_from_twelve_data(ticker)
-        if not res.empty:
-            return res
-        
-        # Finnhub (checks CB & TokenBucket internally)
-        res = download_from_finnhub(ticker)
-        if not res.empty:
-            return res
-        
-        # Polygon (checks CB & TokenBucket internally)
-        res = download_from_polygon(ticker)
-        if not res.empty:
-            return res
+        # Absolute last resort for this ticker.
+        if _CB_GEMINI.allow_request() and _is_plausible_ticker(ticker):
+            res = download_batch_from_gemini_cli([ticker])
+            accepted = consider_candidate(res)
+            if accepted is not None:
+                return ticker, accepted
 
-        # Financial Modeling Prep
-        res = download_from_fmp(ticker)
-        if not res.empty:
-            return res
+        return ticker, best_df
 
-        # EODHD
-        res = download_from_eodhd(ticker)
-        if not res.empty:
-            return res
-        
-        return pd.DataFrame()  # All APIs failed or rate limited
-
-    # Run parallel with defined workers (or 1 for safety)
     try:
         from config import SCANNER_WORKERS
         workers = SCANNER_WORKERS
     except ImportError:
         workers = 1
 
-    # Only run parallel fallback if there are missing tickers
-    if missing_tickers:
+    if fallback_tickers:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            results = list(executor.map(fetch_single_smart, missing_tickers))
-            for r in results:
-                if not r.empty:
-                    all_dfs.append(r)
-                    recovered_tickers.add(r['ticker'].iloc[0])
-            
-    # 3. Alpha Vantage Fallback for remaining gaps (sequential, slower)
-    missing = [t for t in tickers if t not in recovered_tickers]
-    
-    # We only try AV if NOT circuit broken. 
-    # (Token check is inside download_from_alpha_vantage)
+            results = list(executor.map(fetch_single_smart, fallback_tickers))
+            for ticker, frame in results:
+                if frame is None or frame.empty:
+                    continue
+                all_dfs.append(frame)
+                recovered_tickers.add(str(ticker).upper())
+
+    # 2. Alpha Vantage fallback for any still-missing tickers (sequential).
+    missing = [t for t in requested if t not in recovered_tickers]
     if missing and _CB_ALPHAVANTAGE.allow_request():
         print(f"  {len(missing)} tickers still missing. Attempting Alpha Vantage...")
         for ticker in missing:
-            # download_from_alpha_vantage handles token bucket wait/skip
             res = download_from_alpha_vantage(ticker)
-            if not res.empty: 
+            if not res.empty:
                 all_dfs.append(res)
                 recovered_tickers.add(ticker)
                 print(f"    - {ticker} recovered via Alpha Vantage")
-            else:
-                 # If it failed or was skipped due to rate limit, we move closely to next?
-                 # If rate limited, download_from_alpha_vantage returns empty immediate.
-                 # Stop trying if circuit breaker tripped inside or just keep going?
-                 # But we don't want to infinite loop if no one succeeds.
-                 # Just break loop if CB tripped?
-                 if _CB_ALPHAVANTAGE.state == "OPEN":
-                     break
+            elif _CB_ALPHAVANTAGE.state == "OPEN":
+                break
 
-    # 4. FMP fallback for any remaining gaps
-    missing = [t for t in tickers if t not in recovered_tickers]
+    # 3. FMP fallback for any still-missing tickers.
+    missing = [t for t in requested if t not in recovered_tickers]
     if missing and _CB_FMP.allow_request():
         print(f"  {len(missing)} tickers still missing. Attempting FMP...")
         for ticker in missing:
@@ -1175,8 +1253,8 @@ def download_batch_with_fallback(tickers: list) -> pd.DataFrame:
                 all_dfs.append(res)
                 recovered_tickers.add(ticker)
 
-    # 5. EODHD fallback for remaining gaps
-    missing = [t for t in tickers if t not in recovered_tickers]
+    # 4. EODHD fallback for any still-missing tickers.
+    missing = [t for t in requested if t not in recovered_tickers]
     if missing and _CB_EODHD.allow_request():
         print(f"  {len(missing)} tickers still missing. Attempting EODHD...")
         for ticker in missing:
@@ -1185,16 +1263,29 @@ def download_batch_with_fallback(tickers: list) -> pd.DataFrame:
                 all_dfs.append(res)
                 recovered_tickers.add(ticker)
 
-    # 6. Gemini CLI fallback (batched) as absolute last resort
-    missing = [t for t in tickers if t not in recovered_tickers]
+    # 5. Gemini CLI fallback (batched) as absolute last resort.
+    missing = [t for t in requested if t not in recovered_tickers]
     plausible_missing = [t for t in missing if _is_plausible_ticker(t)]
     if plausible_missing and _CB_GEMINI.allow_request():
         print(f"  {len(plausible_missing)} tickers still missing. Attempting gemini-cli fallback...")
         gem_df = download_batch_from_gemini_cli(plausible_missing)
         if not gem_df.empty:
             all_dfs.append(gem_df)
-            
-    return pd.concat(all_dfs) if all_dfs else pd.DataFrame()
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    merged = pd.concat(all_dfs, ignore_index=True)
+    if "ticker" in merged.columns:
+        merged["ticker"] = merged["ticker"].astype(str).str.upper()
+    if "date" in merged.columns:
+        merged["date"] = pd.to_datetime(merged["date"], errors="coerce", utc=True).dt.tz_convert(None).dt.normalize()
+        merged = merged.dropna(subset=["date"])
+    if {"ticker", "date"}.issubset(merged.columns):
+        merged = merged.sort_values(["ticker", "date"]).drop_duplicates(
+            subset=["ticker", "date"], keep="last"
+        )
+    return merged.reset_index(drop=True)
 
 def download_with_fallback(ticker: str) -> pd.DataFrame:
     """Single-ticker fallback chain (same order as batch, ending with gemini-cli)."""
@@ -1313,10 +1404,7 @@ def _fetch_fundamentals_alphavantage(ticker: str) -> dict:
                 continue
 
             # AV returns numeric fields as strings
-            try:
-                div_yield = float(data.get("DividendYield", 0))
-            except Exception:
-                div_yield = 0.0
+            div_yield = _normalize_dividend_yield(data.get("DividendYield", 0))
 
             try:
                 pe = float(data.get("PERatio", 0))
@@ -1360,13 +1448,9 @@ def _fetch_fundamentals_finnhub(ticker: str) -> dict:
             if "metric" in data:
                 m = data["metric"]
                 # dividendYieldIndicatedAnnual is usually good
-                dy = m.get("dividendYieldIndicatedAnnual", 0) or m.get("dividendYield5Y", 0)
-                # Finnhub returns percentage (e.g. 1.5 for 1.5%), we need decimal usually or check
-                # User wants 4.2% -> 0.042? 
-                # YFinance returns 0.042. AV returns 0.042. 
-                # Finnhub documentation says "Annual Dividend Yield". usually %
-                if dy and dy > 0.5: # massive heuristic: if > 0.5, likely %.
-                     dy = dy / 100.0
+                dy = _normalize_dividend_yield(
+                    m.get("dividendYieldIndicatedAnnual", 0) or m.get("dividendYield5Y", 0)
+                )
                      
                 return {
                     'dividend_yield': dy,
@@ -1398,7 +1482,7 @@ def get_ticker_fundamentals(ticker: str) -> dict:
     try:
         if _CB_YFINANCE.allow_request():
             info = yf.Ticker(ticker).info
-            dy = info.get('dividendYield', 0) or 0
+            dy = _normalize_dividend_yield(info.get('dividendYield', 0) or 0)
             if dy > 0:
                 _CB_YFINANCE.record_success()
                 return {
@@ -1462,7 +1546,7 @@ def estimate_dividend_yield_from_history(ticker: str, trailing_days: int, max_ag
         if price <= 0:
             return 0.0
 
-        return trailing_sum / price
+        return _normalize_dividend_yield(trailing_sum / price)
     except Exception:
         return 0.0
 
