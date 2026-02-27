@@ -13,7 +13,7 @@ It runs entirely on your machine — no cloud account, no subscription, no data 
 ## What does it actually do?
 
 1. **Pulls market data** from yfinance and up to 10 fallback providers, so a single API outage never stops you.
-2. **Computes signals** from technicals (RSI, MACD, Bollinger Bands, etc.), macro indicators (yield curve, VIX, credit spreads via FRED), and qualitative features (sector, moat, debt level).
+2. **Computes signals** from technicals (RSI, MACD, Bollinger Bands, etc.), macro indicators (yield curve, VIX, credit spreads via FRED), qualitative features (sector, moat, debt level), and daily news assessment (trade policy, geopolitical, regulatory, energy supply, monetary surprises via Gemini CLI).
 3. **Trains an ensemble ML model** (Random Forest + Gradient Boosting + optional XGBoost) on 5-year history, scoring each ticker across 5d/10d/30d horizons.
 4. **Scans your universe** and synthesizes a BUY/HOLD/SELL recommendation for every ticker, with calibrated confidence scores.
 5. **Generates a daily report** (Markdown + JSON) with top picks, exit alerts for your holdings, and data-health checks.
@@ -68,6 +68,7 @@ flowchart LR
 | `python src/main.py --pipeline daily` | Daily refresh (skip training, reuse existing model) |
 | `python src/main.py --pipeline daily_auto` | Same as `daily` but designed for unattended/cron use |
 | `python src/main.py --scan` | Scan only (generate recommendations from existing model) |
+| `python src/main.py --update-news` | Fetch daily market news assessment via Gemini CLI |
 | `python src/main.py --report` | Regenerate the report from the latest scan results |
 
 ### Training and calibration
@@ -98,8 +99,8 @@ python src/dashboard.py
 ```
 
 From the dashboard you can:
-- Start/stop any pipeline step (scan, train, audit, etc.)
-- Schedule recurring jobs
+- Start/stop any pipeline step (scan, train, audit, news, etc.)
+- Schedule recurring jobs (including morning/evening news assessment)
 - Browse reports and logs
 - Edit config with history and rollback
 - View live run status and analytics
@@ -126,7 +127,12 @@ Set your keys in `.env` — see `examples/public/.env.example` for the full list
 
 ### Gemini CLI (optional)
 
-If all standard providers fail for a ticker, MktML can optionally call [Gemini CLI](https://github.com/google-gemini/gemini-cli) as a last resort to recover price data. It's also used for refreshing qualitative features (sector/industry classifications). Disabled by default if the binary isn't found.
+[Gemini CLI](https://github.com/google-gemini/gemini-cli) is used for three things:
+1. **Daily news assessment** — grounded web search produces signed risk scores for trade policy, geopolitical, regulatory, monetary policy, energy/commodity, and event shock categories. Runs twice daily (morning pre-market + evening post-close) with automatic model fallback.
+2. **Qualitative features** — sector/industry classification and moat/debt/maturity ratings for each ticker.
+3. **Price data recovery** — last-resort fallback when all standard data providers fail.
+
+Disabled by default if the binary isn't found. News and qual features gracefully default to neutral when unavailable.
 
 ## Reports and Agent Integration
 
@@ -149,7 +155,7 @@ Send daily or weekly summaries to:
 
 - **Ensemble**: Random Forest + Gradient Boosting + optional XGBoost, weighted and averaged.
 - **Three horizons**: Separate models for 5-day, 10-day, and 30-day predictions.
-- **Feature contract**: A strict ordered list of ~120 features ensures training and inference always use the same inputs. No silent drift.
+- **Feature contract**: A strict ordered list of 124 features (technicals, macro, news, qualitative) ensures training and inference always use the same inputs. No silent drift.
 - **Walk-forward validation**: Out-of-sample only, with purged/embargo-aware splits to prevent lookahead bias.
 - **Calibration**: Probability outputs are calibrated per horizon so a "70% confidence" score means roughly 70% historical accuracy at that threshold.
 - **Asset buckets**: Optionally trains separate models for equities, ETFs, and bonds when sample sizes are large enough.
@@ -159,7 +165,7 @@ Send daily or weekly summaries to:
 | Want to... | Where to look |
 |---|---|
 | Add a new data provider | `src/data_loader.py` — add a downloader function and insert it into the fallback chain |
-| Add new signal features | `src/signals.py` for technicals, `src/macro_loader.py` for macro, `scripts/update_qual_features.py` for qualitative |
+| Add new signal features | `src/signals.py` for technicals, `src/macro_loader.py` for macro, `src/news_loader.py` for news, `scripts/update_qual_features.py` for qualitative |
 | Add a new ML model type | `src/ml_engine.py` and `config.py` |
 | Add a notification channel | `src/notifier.py` |
 | Add dashboard controls | `src/dashboard.py` |
@@ -172,6 +178,7 @@ src/
   data_loader.py   Multi-provider data acquisition with fallback
   signals.py       Technical indicator computation
   macro_loader.py  FRED macro data and regime features
+  news_loader.py   Daily market news assessment via Gemini CLI
   ml_engine.py     Model training, inference, and calibration
   scanner.py       BUY/HOLD/SELL recommendation synthesis
   reporter.py      Markdown + JSON report generation

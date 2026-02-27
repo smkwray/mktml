@@ -1486,16 +1486,18 @@ def extract_qual_features(qual_data: dict = None) -> dict:
     return features
 
 
-def extract_ml_features(df: pd.DataFrame, dividend_info: dict = None, macro_data: dict = None, 
-                        qual_data: dict = None, horizon: int = 10, for_inference: bool = False) -> pd.DataFrame:
+def extract_ml_features(df: pd.DataFrame, dividend_info: dict = None, macro_data: dict = None,
+                        qual_data: dict = None, news_data: dict = None,
+                        horizon: int = 10, for_inference: bool = False) -> pd.DataFrame:
     """
     Extracts ML features including technicals, volume, volatility, dividend, and qualitative info.
-    
+
     Args:
         df: Price DataFrame with OHLCV and technical indicators
         dividend_info: Optional dividend data
         macro_data: Optional macro indicators
         qual_data: Optional qualitative/industry data from gemini-cli
+        news_data: Optional daily market news features from Gemini CLI
         horizon: Prediction horizon in trading days (5, 10, or 30)
     
     Dividend yield is treated as a POSITIVE signal because:
@@ -1607,7 +1609,19 @@ def extract_ml_features(df: pd.DataFrame, dividend_info: dict = None, macro_data
     df['macro_hy_spread'] = macro.get('macro_BAMLH0A0HYM2', 4)
     df['macro_stress'] = macro.get('macro_STLFSI4', 0)
     df['macro_fed_assets_chg'] = macro.get('macro_WALCL_chg1m', 0) / 1e12  # Normalize to trillions
-    
+
+    # === NEWS FEATURES (Daily market-level from Gemini CLI, signed scale) ===
+    news = news_data or {}
+    df['news_trade_policy'] = news.get('news_trade_policy', 0)
+    df['news_geopolitical'] = news.get('news_geopolitical', 0)
+    df['news_regulatory'] = news.get('news_regulatory', 0)
+    df['news_monetary_surprise'] = news.get('news_monetary_surprise', 0)
+    df['news_energy_supply'] = news.get('news_energy_supply', 0)
+    df['news_event_shock'] = news.get('news_event_shock', 0)
+    df['news_sentiment_net'] = news.get('news_sentiment_net', 0)
+    df['news_risk_total'] = news.get('news_risk_total', 0)
+    df['news_risk_chg'] = news.get('news_risk_chg', 0)
+
     # === TIME FEATURES ===
     if 'date' in df.columns:
         dates = pd.to_datetime(df['date'])
@@ -1740,26 +1754,26 @@ FEATURE_COLS = ML_FEATURE_CONTRACT
 
 
 
-def _process_ticker_for_training(ticker, ticker_div_map, macro_data, qual_cache, horizon=10):
+def _process_ticker_for_training(ticker, ticker_div_map, macro_data, qual_cache, news_data=None, horizon=10):
     """Helper function to process a single ticker for training data."""
     try:
         # Check if we have enough data first (fast check)
         # Note: We rely on load_price_data which uses a read-only connection
         # to avoid locking issues in threads.
         df = load_price_data(ticker)
-        if len(df) < 250: 
+        if len(df) < 250:
             return None
-            
+
         # Use pre-fetched dividend info
         div_info = ticker_div_map.get(ticker) or {}
-        
+
         # Get qual data (if available)
         qual_data = qual_cache.get(ticker.upper()) if qual_cache else None
-        
+
         # Generate signals and features with horizon-specific target
         df = generate_signals(df, ticker=ticker, dividend_info=div_info)
-        features = extract_ml_features(df, dividend_info=div_info, macro_data=macro_data, 
-                                       qual_data=qual_data, horizon=horizon)
+        features = extract_ml_features(df, dividend_info=div_info, macro_data=macro_data,
+                                       qual_data=qual_data, news_data=news_data, horizon=horizon)
         
         # Filter valid numeric features
         exclude_cols = ['open', 'high', 'low', 'close', 'volume', 'date', 'ticker', 'meta_label', 'signal', 't0', 't1']
@@ -1834,14 +1848,23 @@ def prepare_training_data(tickers, tracker=None, status_file=None, horizon=10, h
     qual_cache = load_qual_features()
     if qual_cache:
         print(f"  Loaded qual features for {len(qual_cache)} tickers.", flush=True)
-    
+
+    # Load news features (daily market-level, graceful if missing)
+    try:
+        from news_loader import get_news_features
+        news_data = get_news_features()
+        print(f"  Loaded news features: {news_data}", flush=True)
+    except Exception as e:
+        print(f"  Warning: Could not load news features ({e}). Using defaults.", flush=True)
+        news_data = {}
+
     print(f"  Extracting features ({horizon}d horizon, Parallel: {n_workers} workers)...", flush=True)
-    
+
     # Parallel Feature Extraction
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        # Submit all tasks with horizon parameter and qual_cache
+        # Submit all tasks with horizon parameter, qual_cache, and news_data
         future_to_ticker = {
-            executor.submit(_process_ticker_for_training, ticker, ticker_div_map, macro_data, qual_cache, horizon): ticker 
+            executor.submit(_process_ticker_for_training, ticker, ticker_div_map, macro_data, qual_cache, news_data, horizon): ticker
             for ticker in tickers
         }
         print(f"  Submitted {len(future_to_ticker)} tasks to executor.", flush=True)
