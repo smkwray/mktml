@@ -174,9 +174,9 @@ HORIZON_TARGETS = {
 }
 
 # Confluence thresholds
-CONFLUENCE_THRESHOLD = 0.6
-TACTICAL_THRESHOLD = 0.7
-TREND_THRESHOLD = 0.65
+CONFLUENCE_THRESHOLD = 0.55
+TACTICAL_THRESHOLD = 0.65
+TREND_THRESHOLD = 0.60
 
 # Dividend feature parity
 # False = basic dividend features only (matches scan inference defaults)
