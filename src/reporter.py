@@ -194,7 +194,15 @@ def generate_market_report(results: list = None, scan_meta: dict = None):
         from storage import get_connection
         con = get_connection()
         today = datetime.now().strftime('%Y-%m-%d')
-        df = con.execute("SELECT * FROM recommendation_history WHERE date = ? OR status = 'OPEN'", [today]).df()
+        # Use the latest scan for today (preserves multiple intraday scans)
+        df = con.execute("""
+            SELECT * FROM recommendation_history
+            WHERE (date = ? AND scan_time = (
+                SELECT MAX(scan_time) FROM recommendation_history WHERE date = ?
+            ))
+            OR (date = ? AND scan_time IS NULL)
+            OR status = 'OPEN'
+        """, [today, today, today]).df()
         con.close()
     else:
         df = pd.DataFrame(results)
