@@ -945,12 +945,14 @@ def run_performance_audit() -> Dict[str, Any]:
         'remaining_stale_open': 0,
     }
     try:
+        # Deduplicate within the same scan run (date + ticker + scan_time).
+        # Records from different scans on the same day are intentionally preserved.
         dedupe_removed = int(con.execute("""
             SELECT COUNT(*) FROM (
                 SELECT
                     rowid,
                     ROW_NUMBER() OVER (
-                        PARTITION BY date, upper(ticker)
+                        PARTITION BY date, upper(ticker), scan_time
                         ORDER BY rowid DESC
                     ) AS rn
                 FROM recommendation_history
@@ -965,7 +967,7 @@ def run_performance_audit() -> Dict[str, Any]:
                         SELECT
                             rowid,
                             ROW_NUMBER() OVER (
-                                PARTITION BY date, upper(ticker)
+                                PARTITION BY date, upper(ticker), scan_time
                                 ORDER BY rowid DESC
                             ) AS rn
                         FROM recommendation_history

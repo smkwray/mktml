@@ -2,6 +2,7 @@ import duckdb
 import pandas as pd
 import os
 import numpy as np
+from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'market_data.duckdb')
 
@@ -103,7 +104,8 @@ def initialize_db():
             tradable BOOLEAN,
             tradability_reason VARCHAR,
             avg_volume_20d DOUBLE,
-            avg_dollar_volume_20d DOUBLE
+            avg_dollar_volume_20d DOUBLE,
+            scan_time TIMESTAMP
         )
     """)
     con.execute("""
@@ -131,6 +133,10 @@ def initialize_db():
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_recommendation_history_status_date
         ON recommendation_history(status, date)
+    """)
+    con.execute("""
+        CREATE INDEX IF NOT EXISTS idx_rh_date_scantime
+        ON recommendation_history(date, scan_time)
     """)
     con.execute("""
         CREATE INDEX IF NOT EXISTS idx_model_predictions_asof_horizon
@@ -187,6 +193,11 @@ def initialize_db():
     try:
         con.execute("ALTER TABLE recommendation_history ADD COLUMN avg_dollar_volume_20d DOUBLE")
         print("Schema updated: Added avg_dollar_volume_20d column")
+    except:
+        pass
+    try:
+        con.execute("ALTER TABLE recommendation_history ADD COLUMN scan_time TIMESTAMP")
+        print("Schema updated: Added scan_time column to recommendation_history")
     except:
         pass
 
@@ -261,12 +272,22 @@ def get_metadata(ticker: str) -> dict:
     finally:
         con.close()
 
-def save_recommendations(recs: list):
-    """Saves a list of recommendations to history."""
+def save_recommendations(recs: list, scan_time=None):
+    """Saves a list of recommendations to history.
+
+    Args:
+        recs: List of recommendation dicts.
+        scan_time: Optional datetime for this scan run. All records from the
+                   same scan share one timestamp so intraday re-scans don't
+                   overwrite each other.  Defaults to datetime.now().
+    """
     if not recs:
         return
+    if scan_time is None:
+        scan_time = datetime.now()
     con = get_connection()
     df = pd.DataFrame(recs).copy()
+    df['scan_time'] = scan_time
     
     # Ensure new columns exist with defaults if not provided
     if 'conf_5d' not in df.columns:
@@ -314,15 +335,18 @@ def save_recommendations(recs: list):
         return
     df = df.sort_values(['date', 'ticker', 'confidence'], kind='mergesort')
     df = df.drop_duplicates(subset=['date', 'ticker'], keep='last')
-    df_keys = df[['date', 'ticker']].drop_duplicates()
-    
+    df_keys = df[['date', 'ticker', 'scan_time']].drop_duplicates()
+
     try:
+        # Only replace records from the SAME scan run (same scan_time).
+        # Records from earlier scans on the same day are preserved.
         replaced = con.execute("""
             SELECT COUNT(*) FROM recommendation_history
             WHERE EXISTS (
                 SELECT 1 FROM df_keys k
                 WHERE recommendation_history.date = k.date
                   AND upper(recommendation_history.ticker) = upper(k.ticker)
+                  AND recommendation_history.scan_time = k.scan_time
             )
         """).fetchone()[0]
         con.execute("""
@@ -331,19 +355,36 @@ def save_recommendations(recs: list):
                 SELECT 1 FROM df_keys k
                 WHERE recommendation_history.date = k.date
                   AND upper(recommendation_history.ticker) = upper(k.ticker)
+                  AND recommendation_history.scan_time = k.scan_time
             )
         """)
         con.execute("""
-            INSERT INTO recommendation_history 
-            (date, ticker, signal_type, price_at_rec, rsi, sma_50, sma_200, confidence, conf_5d, conf_30d, status, reason, atr_ratio, dividend_yield, is_safe_asset, returns_30d, tradable, tradability_reason, avg_volume_20d, avg_dollar_volume_20d)
-            SELECT date, ticker, signal_type, price_at_rec, rsi, sma_50, sma_200, confidence, conf_5d, conf_30d, status, reason, atr_ratio, dividend_yield, is_safe_asset, returns_30d, tradable, tradability_reason, avg_volume_20d, avg_dollar_volume_20d
+            INSERT INTO recommendation_history
+            (date, ticker, signal_type, price_at_rec, rsi, sma_50, sma_200, confidence, conf_5d, conf_30d, status, reason, atr_ratio, dividend_yield, is_safe_asset, returns_30d, tradable, tradability_reason, avg_volume_20d, avg_dollar_volume_20d, scan_time)
+            SELECT date, ticker, signal_type, price_at_rec, rsi, sma_50, sma_200, confidence, conf_5d, conf_30d, status, reason, atr_ratio, dividend_yield, is_safe_asset, returns_30d, tradable, tradability_reason, avg_volume_20d, avg_dollar_volume_20d, scan_time
             FROM df
         """)
-        print(f"Saved {len(df)} recommendations ({replaced} replaced for same ticker/date).")
+        print(f"Saved {len(df)} recommendations ({replaced} replaced for same scan run).")
     except Exception as e:
         print(f"Error saving recommendations: {e}")
     finally:
         con.close()
+
+
+def get_latest_scan_time(date_str: str):
+    """Return the most recent scan_time for a given date, or None."""
+    con = get_connection()
+    try:
+        row = con.execute(
+            "SELECT MAX(scan_time) FROM recommendation_history WHERE date = ?",
+            [date_str],
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        con.close()
+
 
 def save_price_data(df: pd.DataFrame):
     """Saves price data to the database."""

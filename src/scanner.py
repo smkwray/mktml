@@ -861,8 +861,9 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
     
     total_tickers = len(universe)
     total_chunks = (total_tickers - 1) // chunk_size + 1
+    scan_start_time = datetime.now()
     print(f"Starting full market scan for {total_tickers} tickers...", flush=True)
-    
+
     tracker = ETATracker("market_scan")
     tracker.start_run({"tickers": total_tickers, "chunk_size": chunk_size})
     
@@ -1233,7 +1234,7 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
                     print(f"Error processing {ticker}: {e}", flush=True)
                 
             if processed_chunk_results:
-                save_recommendations(processed_chunk_results)
+                save_recommendations(processed_chunk_results, scan_time=scan_start_time)
                 
                 # Update scan state with timestamps for processed tickers
                 for res in processed_chunk_results:
