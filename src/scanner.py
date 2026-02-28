@@ -1123,22 +1123,25 @@ def run_full_scan(chunk_size: int = 20, return_meta: bool = False):
                     buy_thr_30d = float(thresholds_30d.get('buy', 0.60))
                     sell_thr_30d = float(thresholds_30d.get('sell', 0.40))
 
+                    # Note: 30d calibration compresses outputs to ~[0.01, 0.36],
+                    # so conf_30d can never reach standard thresholds (0.60).
+                    # Use 30d as a non-blocking directional signal instead of
+                    # gating BUY decisions on it.
                     strong_buy = (
                         conf_5d >= max(buy_thr_5d, CONFLUENCE_THRESHOLD)
                         and conf >= max(buy_thr_10d, CONFLUENCE_THRESHOLD)
-                        and conf_30d >= max(buy_thr_30d, CONFLUENCE_THRESHOLD)
                     )
                     tactical_buy = (
                         conf_5d >= max(buy_thr_5d, TACTICAL_THRESHOLD)
                         and conf >= buy_thr_10d
                     )
                     trend_buy = (
-                        conf_30d >= max(buy_thr_30d, TREND_THRESHOLD)
-                        and conf >= buy_thr_10d
+                        conf >= buy_thr_10d
+                        and conf_30d >= 0.30  # relative to 30d's compressed range
                     )
                     confirmed_sell = (
                         conf <= sell_thr_10d
-                        and (conf_5d <= sell_thr_5d or conf_30d <= sell_thr_30d)
+                        and conf_5d <= sell_thr_5d
                     )
 
                     if strong_buy:
@@ -2065,22 +2068,24 @@ def run_replay_scan(start_date: str, end_date: str, flush_rows: int = 5000, max_
             buy_thr_30d = float(thresholds_30d.get('buy', 0.60))
             sell_thr_30d = float(thresholds_30d.get('sell', 0.40))
 
+            # Note: 30d calibration compresses outputs to ~[0.01, 0.36],
+            # so conf_30d can never reach standard thresholds (0.60).
+            # Use 30d as a non-blocking directional signal instead.
             strong_buy = (
                 conf_5d >= max(buy_thr_5d, CONFLUENCE_THRESHOLD)
                 and conf_10d >= max(buy_thr_10d, CONFLUENCE_THRESHOLD)
-                and conf_30d >= max(buy_thr_30d, CONFLUENCE_THRESHOLD)
             )
             tactical_buy = (
                 conf_5d >= max(buy_thr_5d, TACTICAL_THRESHOLD)
                 and conf_10d >= buy_thr_10d
             )
             trend_buy = (
-                conf_30d >= max(buy_thr_30d, TREND_THRESHOLD)
-                and conf_10d >= buy_thr_10d
+                conf_10d >= buy_thr_10d
+                and conf_30d >= 0.30  # relative to 30d's compressed range
             )
             confirmed_sell = (
                 conf_10d <= sell_thr_10d
-                and (conf_5d <= sell_thr_5d or conf_30d <= sell_thr_30d)
+                and conf_5d <= sell_thr_5d
             )
 
             rec_status = "HOLD"
